@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CROWN v12 — Paper Trading Monitor</title>
+<style>
+  :root {
+    --bg: #0a0e0c;
+    --panel: #101512;
+    --panel-border: #1e2b24;
+    --text: #d8e0da;
+    --text-dim: #6b7a71;
+    --accent: #2dd4a0;
+    --accent-dim: #1a5c48;
+    --loss: #e05252;
+    --amber: #d4a12d;
+    --mono: 'IBM Plex Mono', 'SF Mono', Consolas, monospace;
+    --sans: 'Inter', -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+  }
+  .ticker-rule {
+    height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent-dim), var(--accent), var(--accent-dim), transparent);
+    background-size: 200% 100%;
+    animation: scan 3s linear infinite;
+  }
+  @keyframes scan { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  header {
+    padding: 28px 32px 20px;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  h1 {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 600;
+    margin: 0 0 4px;
+    letter-spacing: -0.01em;
+  }
+  .subtitle { color: var(--text-dim); font-size: 13px; font-family: var(--mono); }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 3px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    margin-top: 10px;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); }
+  .dot.live { background: var(--accent); box-shadow: 0 0 8px var(--accent); animation: pulse 2s ease-in-out infinite; }
+  .dot.error { background: var(--loss); }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  #login-screen {
+    max-width: 380px;
+    margin: 80px auto;
+    padding: 32px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+  }
+  #login-screen h2 { font-size: 15px; font-family: var(--mono); margin: 0 0 4px; }
+  #login-screen p { color: var(--text-dim); font-size: 13px; line-height: 1.5; margin: 0 0 20px; }
+  label { display: block; font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-bottom: 5px; }
+  input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 9px 11px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 13px;
+    margin-bottom: 14px;
+  }
+  input:focus { outline: none; border-color: var(--accent-dim); }
+  button {
+    width: 100%;
+    background: var(--accent);
+    color: #06120d;
+    border: none;
+    padding: 10px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:hover { background: #3ee5b0; }
+  button:disabled { background: var(--panel-border); color: var(--text-dim); cursor: wait; }
+  .login-error { color: var(--loss); font-size: 12px; font-family: var(--mono); margin-top: 10px; display: none; }
+
+  main { padding: 28px 32px; display: none; max-width: 1100px; margin: 0 auto; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 24px; }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 16px 18px;
+  }
+  .stat-label { font-family: var(--mono); font-size: 11px; color: var(--text-dim); margin-bottom: 6px; }
+  .stat-value { font-family: var(--mono); font-size: 22px; font-weight: 600; }
+  .stat-value.pos { color: var(--accent); }
+  .stat-value.neg { color: var(--loss); }
+
+  section { margin-bottom: 24px; }
+  h3 {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    text-transform: none;
+    margin: 0 0 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 13px; }
+  th { text-align: left; color: var(--text-dim); font-weight: 500; padding: 6px 10px; font-size: 11px; }
+  td { padding: 8px 10px; border-top: 1px solid var(--panel-border); }
+  tr:hover td { background: rgba(45, 212, 160, 0.03); }
+  .empty-row td { color: var(--text-dim); text-align: center; padding: 20px; font-family: var(--sans); }
+  .side-long { color: var(--accent); }
+  .side-short { color: var(--loss); }
+
+  details {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 14px 18px;
+  }
+  summary {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  pre {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    overflow-x: auto;
+    margin: 12px 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  footer {
+    text-align: center;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 20px;
+  }
+</style>
+</head>
+<body>
+
+<div class="ticker-rule"></div>
+
+<header>
+  <h1>CROWN v12 — Paper Trading Monitor</h1>
+  <div class="subtitle">Bitcoin futures · Adaptive Regime Strategy · simulated capital, no real funds</div>
+  <div class="status-pill"><span class="dot" id="conn-dot"></span><span id="conn-text">not connected</span></div>
+</header>
+
+<div id="login-screen">
+  <h2>Connect to your bot</h2>
+  <p>This page talks directly to your Freqtrade instance's own API — nothing is stored anywhere else. Use the server URL and login you set in config.json / your Render environment variables.</p>
+  <label for="api-url">API URL</label>
+  <input id="api-url" placeholder="https://your-bot.onrender.com" autocomplete="off">
+  <label for="api-user">Username</label>
+  <input id="api-user" autocomplete="off">
+  <label for="api-pass">Password</label>
+  <input id="api-pass" type="password" autocomplete="off">
+  <button id="login-btn" onclick="connect()">Connect</button>
+  <div class="login-error" id="login-error"></div>
+</div>
+
+<main id="dashboard">
+  <div class="grid">
+    <div class="stat-card">
+      <div class="stat-label">wallet balance</div>
+      <div class="stat-value" id="stat-balance">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">total profit / loss</div>
+      <div class="stat-value" id="stat-pnl">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">open trades</div>
+      <div class="stat-value" id="stat-open-count">—</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">win rate (closed)</div>
+      <div class="stat-value" id="stat-winrate">—</div>
+    </div>
+  </div>
+
+  <section>
+    <h3>Open position</h3>
+    <table>
+      <thead><tr><th>pair</th><th>side</th><th>entry price</th><th>current price</th><th>unrealized P&L</th><th>opened</th></tr></thead>
+      <tbody id="open-trades-body">
+        <tr class="empty-row"><td colspan="6">No open position right now.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h3>Closed trades (most recent 15)</h3>
+    <table>
+      <thead><tr><th>pair</th><th>side</th><th>entry</th><th>exit</th><th>P&L</th><th>exit reason</th><th>closed</th></tr></thead>
+      <tbody id="closed-trades-body">
+        <tr class="empty-row"><td colspan="7">No closed trades yet.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <details>
+      <summary>Raw JSON (this is the data the AI's trading is producing — /api/v1/status + /api/v1/profit)</summary>
+      <pre id="raw-json">—</pre>
+    </details>
+  </section>
+</main>
+
+<footer>Auto-refreshes every 5 seconds · Paper trading — simulated wallet, no real capital at risk</footer>
+
+<script>
+let apiUrl = '', apiUser = '', apiPass = '', jwtToken = null, refreshTimer = null;
+
+async function connect() {
+  const btn = document.getElementById('login-btn');
+  const errEl = document.getElementById('login-error');
+  errEl.style.display = 'none';
+
+  apiUrl = document.getElementById('api-url').value.trim().replace(/\/$/, '');
+  apiUser = document.getElementById('api-user').value.trim();
+  apiPass = document.getElementById('api-pass').value;
+
+  if (!apiUrl || !apiUser || !apiPass) {
+    errEl.textContent = 'Fill in all three fields.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Connecting…';
+
+  try {
+    const res = await fetch(`${apiUrl}/api/v1/token/login`, {
+      method: 'POST',
+      headers: { 'Authorization': 'Basic ' + btoa(`${apiUser}:${apiPass}`) }
+    });
+    if (!res.ok) throw new Error(`Login failed (HTTP ${res.status}). Check URL/username/password.`);
+    const data = await res.json();
+    jwtToken = data.access_token;
+
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('dashboard').style.display = 'block';
+    setConnStatus(true);
+    refresh();
+    refreshTimer = setInterval(refresh, 5000);
+  } catch (e) {
+    errEl.textContent = e.message || 'Could not connect. Check the URL is reachable and credentials are correct.';
+    errEl.style.display = 'block';
+    setConnStatus(false, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Connect';
+  }
+}
+
+function setConnStatus(live, error) {
+  const dot = document.getElementById('conn-dot');
+  const text = document.getElementById('conn-text');
+  dot.className = 'dot' + (live ? ' live' : error ? ' error' : '');
+  text.textContent = live ? 'live' : error ? 'connection error' : 'not connected';
+}
+
+async function apiGet(path) {
+  const res = await fetch(`${apiUrl}${path}`, {
+    headers: { 'Authorization': `Bearer ${jwtToken}` }
+  });
+  if (res.status === 401) {
+    // Token expired — try one re-login before giving up.
+    const loginRes = await fetch(`${apiUrl}/api/v1/token/login`, {
+      method: 'POST',
+      headers: { 'Authorization': 'Basic ' + btoa(`${apiUser}:${apiPass}`) }
+    });
+    if (loginRes.ok) {
+      const d = await loginRes.json();
+      jwtToken = d.access_token;
+      const retry = await fetch(`${apiUrl}${path}`, { headers: { 'Authorization': `Bearer ${jwtToken}` } });
+      return retry.json();
+    }
+    throw new Error('Session expired and re-login failed.');
+  }
+  if (!res.ok) throw new Error(`API error on ${path}: HTTP ${res.status}`);
+  return res.json();
+}
+
+function fmtMoney(n) {
+  if (n === undefined || n === null || isNaN(n)) return '—';
+  return n.toLocaleString(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 });
+}
+
+function fmtTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+
+// Freqtrade's exact JSON field names have shifted across versions in the
+// past (e.g. profit_closed_coin vs profit_all_coin naming). Rather than
+// hard-coding one guess and breaking silently if it's wrong, this tries a
+// short list of plausible field names per value and falls back to '—'.
+// The raw JSON panel at the bottom always shows the true field names
+// regardless, so nothing is ever hidden even if a specific stat card can't
+// find its value.
+function firstDefined(obj, keys) {
+  for (const k of keys) {
+    if (obj && obj[k] !== undefined && obj[k] !== null) return obj[k];
+  }
+  return undefined;
+}
+
+async function refresh() {
+  try {
+    const [status, profit, trades, balance] = await Promise.all([
+      apiGet('/api/v1/status'),
+      apiGet('/api/v1/profit'),
+      apiGet('/api/v1/trades?limit=15'),
+      apiGet('/api/v1/balance')
+    ]);
+
+    setConnStatus(true);
+
+    const statusList = Array.isArray(status) ? status : [];
+    const tradesList = Array.isArray(trades?.trades) ? trades.trades : (Array.isArray(trades) ? trades : []);
+
+    // Top stat cards.
+    // FIXED: wallet balance does NOT live in /api/v1/profit (confirmed
+    // against freqtrade 2026.8's own response schema — Profit has no
+    // total_balance/starting_balance/current_balance field at all, so the
+    // old code here always fell through to the '—' fallback). Real balance
+    // lives in /api/v1/balance (schema: Balances), which is now fetched
+    // above. 'total' is the full account total across all currencies;
+    // 'total_bot' is bot-managed funds only, which is what you actually
+    // want for a single-bot paper-trading dashboard like this one —
+    // prefer it, fall back to 'total' if a freqtrade version ever drops it.
+    const balanceValue = firstDefined(balance, ['total_bot', 'total']);
+    document.getElementById('stat-balance').textContent = balanceValue !== undefined ? fmtMoney(balanceValue) : '— (see raw JSON below)';
+
+    const pnl = firstDefined(profit, ['profit_closed_coin', 'profit_all_coin', 'profit_closed_abs', 'profit_all_abs']);
+    const pnlEl = document.getElementById('stat-pnl');
+    if (pnl !== undefined) {
+      pnlEl.textContent = fmtMoney(pnl);
+      pnlEl.className = 'stat-value ' + (pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '');
+    } else {
+      pnlEl.textContent = '— (see raw JSON below)';
+      pnlEl.className = 'stat-value';
+    }
+
+    document.getElementById('stat-open-count').textContent = statusList.length;
+
+    const winrateRaw = firstDefined(profit, ['winrate', 'win_rate']);
+    document.getElementById('stat-winrate').textContent = winrateRaw !== undefined ? (winrateRaw * 100).toFixed(1) + '%' : '—';
+
+    // Open trades table
+    const openBody = document.getElementById('open-trades-body');
+    if (!statusList.length) {
+      openBody.innerHTML = '<tr class="empty-row"><td colspan="6">No open position right now.</td></tr>';
+    } else {
+      openBody.innerHTML = statusList.map(t => {
+        const isShort = !!t.is_short;
+        const openRate = firstDefined(t, ['open_rate']);
+        const currentRate = firstDefined(t, ['current_rate']);
+        const pAbs = firstDefined(t, ['profit_abs']) ?? 0;
+        return `
+        <tr>
+          <td>${t.pair ?? '—'}</td>
+          <td class="${isShort ? 'side-short' : 'side-long'}">${isShort ? 'SHORT' : 'LONG'}</td>
+          <td>${openRate !== undefined ? openRate.toFixed(2) : '—'}</td>
+          <td>${currentRate !== undefined ? currentRate.toFixed(2) : '—'}</td>
+          <td class="${pAbs >= 0 ? 'side-long' : 'side-short'}">${fmtMoney(pAbs)}</td>
+          <td>${fmtTime(t.open_date)}</td>
+        </tr>
+      `;
+      }).join('');
+    }
+
+    // Closed trades table
+    const closedBody = document.getElementById('closed-trades-body');
+    const closedList = tradesList.filter(t => t && t.is_open === false);
+    if (!closedList.length) {
+      closedBody.innerHTML = '<tr class="empty-row"><td colspan="7">No closed trades yet.</td></tr>';
+    } else {
+      closedBody.innerHTML = closedList.map(t => {
+        const isShort = !!t.is_short;
+        const openRate = firstDefined(t, ['open_rate']);
+        const closeRate = firstDefined(t, ['close_rate']);
+        const closeProfit = firstDefined(t, ['close_profit_abs', 'profit_abs']) ?? 0;
+        return `
+        <tr>
+          <td>${t.pair ?? '—'}</td>
+          <td class="${isShort ? 'side-short' : 'side-long'}">${isShort ? 'SHORT' : 'LONG'}</td>
+          <td>${openRate !== undefined ? openRate.toFixed(2) : '—'}</td>
+          <td>${closeRate !== undefined ? closeRate.toFixed(2) : '—'}</td>
+          <td class="${closeProfit >= 0 ? 'side-long' : 'side-short'}">${fmtMoney(closeProfit)}</td>
+          <td>${t.exit_reason ?? '—'}</td>
+          <td>${fmtTime(t.close_date)}</td>
+        </tr>
+      `;
+      }).join('');
+    }
+
+    // Raw JSON — the ground truth, always shown regardless of whether the
+    // stat cards above found their fields.
+    document.getElementById('raw-json').textContent = JSON.stringify({ status, profit, trades, balance }, null, 2);
+
+  } catch (e) {
+    setConnStatus(false, true);
+    document.getElementById('conn-text').textContent = e.message || 'connection error';
+  }
+}
+</script>
+
+</body>
+</html>

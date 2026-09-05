@@ -1,0 +1,25 @@
+# =============================================================================
+# requirements.txt
+#
+# This file was MISSING from your original upload — the Dockerfile
+# (COPY requirements.txt . / RUN pip install -r requirements.txt) references
+# it, but it was never provided. Without it, your Docker build fails at the
+# `pip install` step before Freqtrade is even installed.
+#
+# Versions below are pinned to what was ACTUALLY installed and test-run
+# against your v12_Strategy.py in this session (not guessed):
+#   freqtrade 2026.8, pandas 3.0.2, numpy 2.4.4, TA-Lib 0.7.1
+#
+# Pinned (==) rather than left open, on purpose: an unpinned `freqtrade`
+# could pull a future version that changes the stoploss-ratchet behavior
+# this strategy file depends on (see the long comment on
+# `_ft_stop_uses_after_fill` in v12_Strategy.py) without you knowing. If you
+# want to move to a newer Freqtrade version later, that upgrade should be a
+# deliberate choice — re-verify the ratchet behavior against the new
+# version's freqtradebot.py before trusting Phase 3.5's widen logic again.
+# =============================================================================
+
+freqtrade==2026.8
+pandas==3.0.2
+numpy==2.4.4
+TA-Lib==0.7.1
