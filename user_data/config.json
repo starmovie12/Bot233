@@ -17,7 +17,7 @@
   "$comment_stake_5": "risk samajh kar maanga hai. Blueprint-recommended safer sizing ke",
   "$comment_stake_6": "liye neeche 'stake_amount' ko ek fixed number (e.g. 50000) se",
   "$comment_stake_7": "replace karo aur max_open_trades badhao.",
-  "stake_currency": "USD",
+  "stake_currency": "USDT",
   "stake_amount": "unlimited",
   "tradable_balance_ratio": 1.0,
   "max_open_trades": 1,
@@ -43,7 +43,7 @@
     "ccxt_config": {},
     "ccxt_async_config": {},
     "pair_whitelist": [
-      "BTC/USD:USD"
+      "BTC/USDT:USDT"
     ],
     "pair_blacklist": []
   },
