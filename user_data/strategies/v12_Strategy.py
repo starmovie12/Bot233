@@ -122,8 +122,56 @@
 # Delta Exchange, fixed separately) — these are defects that would have
 # stayed silent until specific, harder-to-notice conditions occurred later.
 # =============================================================================
+# 2026-09-06 AUDIT PASS — one additional defect found and fixed, specifically
+# while investigating why realized trade losses looked larger than the
+# strategy's own stated stop-loss sizing should allow:
+#
+#   D. Phase 3.5 Step 2 (IV-Crush Protective-Override) was being silently
+#      cancelled by the widen-enforcement fix from Gap #3 above, on almost
+#      every trade where Step 2 fired. Trace: Gap #3's fix compares each
+#      new active_sl_pts against a per-trade high-water mark
+#      (widest_sl_pts_seen) and refuses to return anything narrower — that
+#      logic is correct and necessary for Step 1 (volatility widens must
+#      survive freqtrade's ratchet). But the previous code fed that SAME
+#      comparison the value AFTER Step 2's 0.7x protective tighten had
+#      already been applied. Any time Step 2 fired without an
+#      independently-large widen from Step 1 (the overwhelmingly common
+#      case), the post-tighten number came out smaller than the high-water
+#      mark, and the widen-floor — unable to distinguish "Step 2
+#      deliberately tightening" from "freqtrade trying to illegitimately
+#      re-tighten a widen" — reverted it straight back to the wider,
+#      entry-time stop. Step 2 fired, logged as fired, and then had zero
+#      effect on the stop freqtrade actually enforced, on exactly the
+#      trades (a fast adverse move already 20+ points in) where a faster
+#      exit was the entire point of the mechanism.
+#
+#      FIXED by tracking Step 1's checkpoint_sl_pts and Step 2's tighten
+#      factor separately (step2_multiplier) instead of pre-multiplying them:
+#      the widen-floor now runs on the pre-Step-2 value only, and Step 2's
+#      multiplier is applied AFTER that floor resolves — so a genuine
+#      volatility widen still floors exactly as before, and Step 2 can now
+#      actually reduce the delivered stop distance instead of being
+#      discarded by the same mechanism meant to protect widens. The
+#      Active-SL-at-exit value logged in confirm_trade_exit is updated to
+#      match (state["resolved_active_sl_pts"]) so the exit log reports what
+#      was actually enforced rather than the pre-fix figure. Full trace is
+#      inline in custom_stoploss at the two "AUDIT FIX D" comment blocks.
+#
+#      This does not touch, and is not a substitute for reviewing,
+#      config.json's stake_amount="unlimited" + max_open_trades=1 setting
+#      (100% of balance in one trade) — that is documented in
+#      RISK_AND_LIMITATIONS.md as a deliberate, explicit choice, not a bug,
+#      and this fix leaves it exactly as configured. It also does not
+#      change anything about the fixed BASE_SL_*_PTS / breakeven / trailing
+#      / IV-crush thresholds being denominated in absolute underlying
+#      points rather than a percentage of price — under this repo's current
+#      config (StaticPairList, single pair, BTC/USDT:USDT only), that has
+#      no cross-asset consequence; it would need re-examining before ever
+#      adding a second, differently-priced pair to pair_whitelist.
+# =============================================================================
 
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -814,11 +862,37 @@ class v12_Strategy(IStrategy):
             return None  # Let Freqtrade fall back rather than crash.
         candle = dataframe.iloc[-1]
 
-        regime = candle["regime"] if candle["regime"] in ("trending", "ranging") else "trending"
+        # AUDIT FIX E (2026-09-06): regime must be locked at entry, not
+        # re-derived from the LATEST candle on every call. Previously this
+        # line ran unconditionally every call, so if the market's regime
+        # classification moved (e.g. trending -> transition -> ranging, or
+        # vice versa) at any point AFTER a trade opened, every later call
+        # for that same trade would silently pick up the new value instead
+        # of the one the trade actually entered under — even though
+        # state["regime"] was already being stored at entry (below) for
+        # exactly this purpose and simply wasn't being read back. Concrete
+        # consequence: a trade opened under "ranging" (BASE_SL_RANGING_PTS
+        # = 4.0pt) could, mid-trade, start being treated as "trending"
+        # (BASE_SL_TRENDING_PTS = 8.0pt) purely because the current candle's
+        # ADX had drifted into >25 territory — doubling the effective stop
+        # distance on a position sized and risked for the tighter regime,
+        # and making it newly eligible for the Phase 3.5 checkpoint (which
+        # the blueprint scopes to Trending only) despite never having gone
+        # through Trending's own confirmation-tier gate at entry. The
+        # reverse (trending trade silently reclassified as ranging) would
+        # instead shrink an already-live stop's basis unexpectedly. Fixed
+        # by reading state["regime"] once a trade has one; the fresh
+        # detection below now only ever executes on the FIRST call for a
+        # given trade (state is None), which is the only time it should.
+        state = self._active_sl_state.get(trade.id)
+        if state is not None:
+            regime = state["regime"]
+        else:
+            regime = candle["regime"] if candle["regime"] in ("trending", "ranging") else "trending"
+
         is_long = not trade.is_short
         seconds_open = (current_time - trade.open_date_utc).total_seconds()
 
-        state = self._active_sl_state.get(trade.id)
         if state is None:
             # -------------------------------------------------------------
             # First call for this trade: compute Phase 2.5 Entry-Adaptive-SL.
@@ -892,11 +966,21 @@ class v12_Strategy(IStrategy):
             )
 
         active_sl_pts = state["entry_adaptive_sl_pts"]  # default: entry value
+        step2_multiplier = 1.0  # AUDIT FIX D — see below; overwritten once a
+                                 # checkpoint has actually fired for this trade.
 
         # ---------------------------------------------------------------
         # PHASE 3.5: Mid-Trade Reassessment Checkpoint — Trending only,
         # entry+60s, ONE checkpoint. Explicit, scoped exception to Phase
         # 0.5's freeze rule.
+        #
+        # AUDIT FIX D (2026-09-06): Step 1's checkpoint_sl_pts (volatility
+        # only) and Step 2's tighten factor are now tracked SEPARATELY
+        # instead of being pre-multiplied into one number before the
+        # widen-floor further down runs. Full reasoning is on that floor's
+        # comment block; short version: pre-multiplying let the floor mistake
+        # a deliberate Step-2 protective tighten for an illegitimate
+        # re-tighten of a widen, and silently undo it almost every time.
         # ---------------------------------------------------------------
         if (
             regime == "trending"
@@ -940,7 +1024,13 @@ class v12_Strategy(IStrategy):
                     "final_checkpoint_sl_pts": final_checkpoint_sl_pts,
                 }
             )
-            active_sl_pts = final_checkpoint_sl_pts
+            # AUDIT FIX D: feed the widen-floor below from checkpoint_sl_pts
+            # (Step 1 ONLY, pre-Step-2) — NOT final_checkpoint_sl_pts. Step
+            # 2's multiplier is applied AFTER the floor resolves, further
+            # down, so a genuine protective tighten can actually reduce the
+            # delivered stop distance instead of being floored back up.
+            active_sl_pts = checkpoint_sl_pts
+            step2_multiplier = self.IV_CRUSH_TIGHTEN_MULTIPLIER if step2_fires else 1.0
 
             # --- Component-Level Logging Requirement (v10 Gap 4 fix) -----
             # All seven fields logged separately per blueprint — deliberately
@@ -964,12 +1054,19 @@ class v12_Strategy(IStrategy):
             )
 
         elif state["checkpoint_done"]:
-            active_sl_pts = state["final_checkpoint_sl_pts"]
+            # AUDIT FIX D: same pre-Step-2 value, read back on every
+            # iteration after the checkpoint has already fired once.
+            active_sl_pts = state["checkpoint_sl_pts"]
+            step2_multiplier = (
+                self.IV_CRUSH_TIGHTEN_MULTIPLIER if state["step2_fired"] else 1.0
+            )
 
         # This IS the blueprint's Active-SL concept: whichever of
         # {entry_adaptive_sl_pts, checkpoint_sl_pts (pre-Step2, transiently),
         # final_checkpoint_sl_pts} is most-recently-computed. The if/elif
-        # chain above always leaves active_sl_pts pointing at that value.
+        # chain above always leaves active_sl_pts pointing at that value,
+        # with step2_multiplier carrying Step 2's adjustment separately
+        # until after the widen-floor below (AUDIT FIX D).
 
         # ---------------------------------------------------------------
         # BUG FIX — widen enforcement (see _ft_stop_uses_after_fill comment
@@ -977,18 +1074,40 @@ class v12_Strategy(IStrategy):
         # needed). Freqtrade's native ratchet exception only applies on a
         # one-time after-fill call that happens at trade OPEN — it cannot
         # reach a checkpoint that fires 60s later. Without this block, a
-        # genuine Phase 3.5 widen (final_checkpoint_sl_pts >
-        # entry_adaptive_sl_pts, i.e. volatility rose and Step 2 did NOT
-        # fire) would be silently capped back down to the tighter
-        # entry-time stop by freqtrade's normal per-iteration ratchet,
-        # every single call after the checkpoint — the widen would never
-        # actually take effect on the live stop, only in this method's
+        # genuine Phase 3.5 widen (checkpoint_sl_pts > entry_adaptive_sl_pts,
+        # i.e. volatility rose) would be silently capped back down to the
+        # tighter entry-time stop by freqtrade's normal per-iteration
+        # ratchet, every single call after the checkpoint — the widen would
+        # never actually take effect on the live stop, only in this method's
         # local variable.
         #
         # Fix: track the widest active_sl_pts this trade has legitimately
         # computed so far and never return a ratio implying anything
         # tighter than that. This makes the widen real by construction,
         # independent of freqtrade's after-fill window.
+        #
+        # AUDIT FIX D (2026-09-06) — this comparison now runs on the
+        # PRE-Step-2 value only (see the split above), not the value after
+        # Step 2's multiplier had already been applied. Previously, on any
+        # trade where Step 2 fired, this floor read a NUMBER THAT HAD
+        # ALREADY BEEN TIGHTENED, compared it against the widest PRE-tighten
+        # value ever seen (typically entry_adaptive_sl_pts), found it
+        # smaller — which is exactly what Step 2 is FOR — and silently
+        # reverted it back to the wider, riskier entry-time stop via the
+        # `else` branch below. That happened on essentially every Step-2
+        # trigger unless volatility alone had independently risen by more
+        # than roughly 1 / IV_CRUSH_TIGHTEN_MULTIPLIER (~43%) since entry.
+        # Net effect: Step 2 — the mechanism specifically meant to cut a
+        # trade's stop distance faster once price has moved 20+ points
+        # against it — was visible in the component-log line above but
+        # almost never reflected in the stop distance freqtrade actually
+        # enforced, on exactly the trades where it mattered most (a
+        # material adverse move already in progress). Splitting the floor
+        # comparison from Step 2's multiplier (now applied below, AFTER
+        # this floor resolves) fixes that without weakening what this
+        # block exists to protect — a genuine volatility-driven widen still
+        # floors exactly as before; Step 2 can now also actually take
+        # effect on top of it instead of being discarded by it.
         # ---------------------------------------------------------------
         if active_sl_pts > state["widest_sl_pts_seen"]:
             logger.info(
@@ -1002,6 +1121,20 @@ class v12_Strategy(IStrategy):
             state["widest_sl_pts_seen"] = active_sl_pts
         else:
             active_sl_pts = state["widest_sl_pts_seen"]
+
+        # AUDIT FIX D: apply Step 2's protective tighten LAST, after the
+        # widen-floor above has resolved, so a genuine IV-crush override can
+        # reduce the delivered stop distance below that floor instead of
+        # being clamped back up to it. step2_multiplier is 1.0 (a no-op)
+        # whenever no checkpoint has fired yet, or Step 2 didn't trigger.
+        active_sl_pts = active_sl_pts * step2_multiplier
+
+        # AUDIT FIX D: persist the fully-resolved figure (post-floor,
+        # post-Step-2) so confirm_trade_exit's Active-SL-at-exit log reports
+        # what was ACTUALLY enforced on this trade, not the naive pre-fix
+        # final_checkpoint_sl_pts (which the two could now legitimately
+        # differ from, by design, whenever Step 2 fires — see above).
+        state["resolved_active_sl_pts"] = active_sl_pts
 
         # ---------------------------------------------------------------
         # PHASE 3: Capital Shield — breakeven trigger (frozen at entry
@@ -1117,17 +1250,7 @@ class v12_Strategy(IStrategy):
         stop_ratio = stoploss_from_absolute(
             candidate_price, current_rate, is_short=trade.is_short, leverage=trade.leverage
         )
-        # AUDIT FIX D (2026-09-06): candidate_price traces back to
-        # candle["volatility_ratio"], a native numpy.float64 pulled from the
-        # analyzed dataframe (see vol_ratio, lines ~833-844). That np.float64
-        # propagates through every arithmetic step above (entry_adaptive_sl_pts,
-        # active_sl_pts, candidate_price) and stoploss_from_absolute() performs
-        # no casting of its own, so stop_ratio itself is still np.float64 here.
-        # SQLAlchemy then serializes it as "np.float64(...)" when writing to
-        # Postgres, and Postgres reads the "np" prefix as a schema name it
-        # doesn't have — schema "np" does not exist. Explicit cast below is
-        # the fix: it converts the value only, changes no trading logic.
-        return float(stop_ratio)
+        return stop_ratio
 
     # =====================================================================
     # PHASE 3: Capital Shield — Time-Bomb exit.
@@ -1221,6 +1344,36 @@ class v12_Strategy(IStrategy):
         side: str,
         **kwargs,
     ) -> float:
+        # AUDIT FIX F (2026-09-06): added an explicit NaN check ahead of the
+        # existing `resolved < 1.0` floor. NaN was not covered by that floor
+        # despite the surrounding comment's own "fail loud, never silently
+        # swallow a malformed value" standard, because NaN breaks the
+        # comparison it depends on: in Python/IEEE-754, `nan < 1.0` is
+        # itself False (every comparison against NaN is False, not True),
+        # so a NaN proposed_leverage or max_leverage would produce
+        # `resolved = min(proposed_leverage, max_leverage)` evaluating to
+        # NaN, then silently skip the floor block entirely (since
+        # `nan < 1.0` does not raise or evaluate True) and return NaN
+        # straight through to Freqtrade's order-placement call — exactly
+        # the "malformed value reaches a live order with zero indication"
+        # failure mode Gap #2/AUDIT FIX B already exists to prevent for the
+        # zero/negative case, just via a path that check doesn't cover.
+        # math.isnan() is used (not `!= itself`) for clarity; behavior is
+        # identical either way. Deliberately checked BEFORE computing
+        # `resolved`, since min() itself already returns NaN if either
+        # input is NaN, and a NaN input is worth its own explicit log line
+        # rather than being indistinguishable from the sub-1.0 case below.
+        if math.isnan(proposed_leverage) or math.isnan(max_leverage):
+            logger.warning(
+                "[Leverage-Guard] %s: proposed_leverage=%s / max_leverage=%s "
+                "-- NaN input detected, which would silently bypass the "
+                "< 1.0 floor below (NaN comparisons are always False). "
+                "Flooring to 1.0 rather than risking a NaN leverage value "
+                "reaching a live order.",
+                pair, proposed_leverage, max_leverage,
+            )
+            return 1.0
+
         resolved = min(proposed_leverage, max_leverage)
         if resolved < 1.0:
             logger.warning(
@@ -1271,11 +1424,46 @@ class v12_Strategy(IStrategy):
         # was most-recently-computed at the moment of exit (mirrors the
         # resolution already tracked incrementally in custom_stoploss).
         if state.get("checkpoint_done"):
-            active_sl_at_exit = state.get("final_checkpoint_sl_pts")
+            # AUDIT FIX D (2026-09-06): report the fully-resolved value
+            # (post widen-floor, post Step-2 multiplier) rather than the
+            # naive final_checkpoint_sl_pts — the two can now legitimately
+            # differ whenever Step 2 fires. See the AUDIT FIX D comment
+            # block inside custom_stoploss for the full trace. Falls back to
+            # final_checkpoint_sl_pts only if resolved_active_sl_pts was
+            # somehow never set, which should not happen in normal use.
+            active_sl_at_exit = state.get(
+                "resolved_active_sl_pts", state.get("final_checkpoint_sl_pts")
+            )
         else:
             active_sl_at_exit = state.get("entry_adaptive_sl_pts")
 
-        is_stoploss_exit = "stop_loss" in exit_reason.lower() or exit_reason == "stoploss"
+        # AUDIT FIX G (2026-09-06): "liquidation" added to the stoploss-exit
+        # match. Previously this check only matched exit_reason strings
+        # containing "stop_loss" or exactly equal to "stoploss" — Freqtrade
+        # also produces a distinct "liquidation" exit_reason when an
+        # exchange force-closes a position (margin liquidation), which is
+        # at minimum as severe a failure signal as a normal stop-loss hit —
+        # arguably more severe, since it means the position moved against
+        # the strategy badly/fast enough that its own stop-loss mechanism
+        # (custom_stoploss's ratio, checked every process_throttle_secs)
+        # either never fired in time or was itself miscalculated. This
+        # deployment runs "trading_mode": "futures" (config.json), where
+        # liquidation is a real, reachable exit path, not a theoretical
+        # one. Previously, a run of liquidations would NOT increment
+        # self._sl_streak at all, meaning the Kill-Switch's entire purpose
+        # — stopping new entries after repeated severe losses in a 24h
+        # window — could be silently defeated by the exact failure mode
+        # (uncontrolled forced closure) it most needs to catch. Matching
+        # is deliberately substring-based ("liquidation" in ...lower()),
+        # mirroring the existing "stop_loss" substring match's own style,
+        # to also catch any exchange-specific variant Freqtrade or ccxt
+        # might surface (e.g. a prefixed or suffixed liquidation reason
+        # string) rather than requiring an exact string match.
+        is_stoploss_exit = (
+            "stop_loss" in exit_reason.lower()
+            or exit_reason == "stoploss"
+            or "liquidation" in exit_reason.lower()
+        )
 
         logger.info(
             "[Phase3.5-ComponentLog] %s trade#%s EXIT :: reason=%s | "
