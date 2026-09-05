@@ -1,0 +1,105 @@
+{
+  "$comment_START_HERE": "===================================================================",
+  "$comment_1": "PAPER TRADING CONFIG — Adaptive Regime Strategy v12 on Bitcoin Futures",
+  "$comment_2": "dry_run is TRUE below. Paisa fake hai. Isko 'false' karne se pehle",
+  "$comment_3": "poora RISK_AND_LIMITATIONS.md padhna — ismein bataya gaya hai kya-kya",
+  "$comment_4": "is strategy mein reliably kaam nahi karta.",
+  "$comment_END_HERE": "===================================================================",
+
+  "dry_run": true,
+  "dry_run_wallet": 500000,
+  "cancel_open_orders_on_exit": false,
+
+  "$comment_stake": "----- POSITION SIZING: '100% balance ek hi trade mein' ----------",
+  "$comment_stake_2": "'unlimited' + max_open_trades=1 ka matlab hai: available balance ka",
+  "$comment_stake_3": "POORA hissa har naye trade mein chala jaata hai. Yeh Blueprint ke",
+  "$comment_stake_4": "apne Phase-2 sizing-ratio se ALAG hai — user ne explicitly yeh",
+  "$comment_stake_5": "risk samajh kar maanga hai. Blueprint-recommended safer sizing ke",
+  "$comment_stake_6": "liye neeche 'stake_amount' ko ek fixed number (e.g. 50000) se",
+  "$comment_stake_7": "replace karo aur max_open_trades badhao.",
+  "stake_currency": "USD",
+  "stake_amount": "unlimited",
+  "tradable_balance_ratio": 1.0,
+  "max_open_trades": 1,
+  "amend_last_stake_amount": false,
+
+  "$comment_trading_mode": "----- FUTURES MODE ---------------------------------------------",
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+
+  "timeframe": "1m",
+
+  "$comment_exchange": "----- DELTA INDIA (BTC futures, INR-adjacent via USD-settled) ----",
+  "$comment_exchange_2": "'sandbox: true' = exchange's own demo/paper environment.",
+  "$comment_exchange_3": "Combined with dry_run=true above, trades are simulated TWICE over —",
+  "$comment_exchange_4": "safe by default. Isko real account se jodne ke liye keys bharo AND",
+  "$comment_exchange_5": "dono flags ko jaan-boojh kar false karo, ek saath nahi.",
+  "exchange": {
+    "name": "delta",
+    "india": true,
+    "sandbox": true,
+    "key": "",
+    "secret": "",
+    "ccxt_config": {},
+    "ccxt_async_config": {},
+    "pair_whitelist": [
+      "BTC/USD:USD"
+    ],
+    "pair_blacklist": []
+  },
+
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+
+  "entry_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1,
+    "check_depth_of_market": {
+      "enabled": false
+    }
+  },
+  "exit_pricing": {
+    "price_side": "same",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+
+  "$comment_api": "----- REST API / JSON — yehi aapke browser-URL ka source hai -----",
+  "$comment_api_2": "PASSWORD NEEDS CHANGING — 'jwt_secret_key' bhi. Neeche",
+  "$comment_api_3": "DEPLOY_GUIDE.md mein bataya gaya hai isko Render environment",
+  "$comment_api_4": "variable se kaise override karein, taaki yeh file mein plaintext",
+  "$comment_api_5": "na rahe jab aap ise GitHub par push karein.",
+  "api_server": {
+    "enabled": true,
+    "listen_ip_address": "0.0.0.0",
+    "listen_port": 8080,
+    "verbosity": "error",
+    "enable_openapi": true,
+    "jwt_secret_key": "CHANGE_ME_BEFORE_DEPLOY_random_string_here",
+    "CORS_origins": [],
+    "username": "crown_admin",
+    "password": "CHANGE_ME_BEFORE_DEPLOY"
+  },
+
+  "$comment_db": "----- DATABASE — Render restart pe data na khoye, isliye Postgres --",
+  "$comment_db_2": "DEPLOY_GUIDE.md follow karke apna Neon/Supabase connection-string",
+  "$comment_db_3": "yahan (ya Render env-var 'DB_URL' ke through) daalo. Placeholder",
+  "$comment_db_4": "chhod-diya toh SQLite use hogi — jo Render free pe restart pe",
+  "$comment_db_5": "reset ho sakti hai.",
+  "db_url": "sqlite:///user_data/tradesv3.dryrun.sqlite",
+
+  "initial_state": "running",
+  "force_entry_enable": false,
+  "internals": {
+    "process_throttle_secs": 5
+  },
+
+  "bot_name": "CROWN-v12-PaperTrading",
+
+  "dataformat_ohlcv": "feather",
+  "dataformat_trades": "feather"
+}
