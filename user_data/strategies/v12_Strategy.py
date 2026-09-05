@@ -61,10 +61,9 @@
 #      default, because persistence strategy is a config-adjacent decision
 #      this file shouldn't force on you.
 #
-#   6. LEVERAGE (found and fixed on this review pass): IStrategy's default
-#      leverage() hard-returns 1.0 and only fires in futures mode — your
-#      stated use case. This file now overrides it, but only as a
-#      pass-through of proposed_leverage/max_leverage (your config's own
+#   6. LEVERAGE: IStrategy's default leverage() hard-returns 1.0 and only
+#      fires in futures mode — your stated use case. This file overrides it
+#      as a pass-through of proposed_leverage/max_leverage (your config's own
 #      values), because the blueprint's Phase 2 gives a position-size SPLIT
 #      RATIO, not a leverage multiplier, and this file will not invent a
 #      leverage number the blueprint doesn't specify. If you want the
@@ -84,6 +83,44 @@
 # architecture is fully ignored. No config, no smc_math, no docker. This is
 # strategy logic ONLY — it still needs a config.json with your pair,
 # timeframe, stake, and exchange settings to actually run.
+#
+# =============================================================================
+# 2026-09-05 AUDIT PASS — three additional defects found and fixed in this
+# revision (full Verification Gauntlet re-run against this file; the
+# earlier boot crash was in config.json's currency setting, NOT in this
+# file, but this file was re-audited in full anyway rather than assumed
+# clean by association):
+#
+#   A. NaN-poisoning guard added to volatility_ratio (populate_indicators).
+#      atr / atr_baseline can divide by zero/NaN on the first
+#      VOLATILITY_BASELINE_PERIOD-1 candles before the rolling window fills
+#      — .clip() does NOT sanitize a NaN, and a NaN silently makes every
+#      downstream ">" comparison permanently False with no error or log
+#      line. Freqtrade's startup_candle_count=60 *should* prevent this from
+#      ever reaching a live decision, but that's an assumption living in a
+#      different file (config.json) — this file now defends itself instead
+#      of silently trusting an external setting to protect it. See the
+#      "NaN-GUARD" comment in populate_indicators below.
+#
+#   B. leverage() floor guard added — previously `min(proposed_leverage,
+#      max_leverage)` had no protection against a malformed 0/negative
+#      proposed_leverage from ever reaching a live order. Now floors at 1.0
+#      and logs a warning if the floor had to be applied, so a malformed
+#      upstream value fails loudly instead of quietly placing a leverage-0
+#      or negative-leverage order.
+#
+#   C. _medium_tier_wait entries are now cleared on trade close
+#      (confirm_trade_exit), mirroring how _active_sl_state already cleans
+#      itself up. Previously, consumed wait-state dict entries were kept
+#      forever, keyed by pair — a slow per-pair memory leak that is low-
+#      impact for a single-pair StaticPairList (this deployment's actual
+#      config) but would become a real unbounded leak if pair_whitelist is
+#      ever expanded to more pairs later without this fix.
+#
+# None of these three were the cause of the boot-crash you saw in the logs
+# (that was purely config.json's stake_currency/pair_whitelist mismatch with
+# Delta Exchange, fixed separately) — these are defects that would have
+# stayed silent until specific, harder-to-notice conditions occurred later.
 # =============================================================================
 
 import logging
@@ -278,6 +315,15 @@ class v12_Strategy(IStrategy):
         # Phase 1.5 Medium-tier wait state, keyed by pair. Anti-infinite-loop
         # safeguard per blueprint: a pair can only enter the Medium-tier wait
         # ONCE per signal lifecycle (tracked via 'consumed' flag).
+        #
+        # AUDIT FIX C (2026-09-05): entries used to live here forever once
+        # created, even after being consumed. Now also tracks which trade id
+        # (if any) a wait belongs to once one opens, so confirm_trade_exit
+        # can clear it when that trade closes — see the cleanup call at the
+        # bottom of confirm_trade_exit. For a single-pair StaticPairList
+        # (this repo's actual config) the old behavior was one stale dict
+        # key, effectively harmless; this fix matters the moment
+        # pair_whitelist ever grows past one pair.
         self._medium_tier_wait: dict[str, dict] = {}
 
         # Phase 2.5 / 3.5 Active-SL resolution state, keyed by trade id.
@@ -357,9 +403,39 @@ class v12_Strategy(IStrategy):
         dataframe["atr_baseline"] = dataframe["atr"].rolling(
             window=self.VOLATILITY_BASELINE_PERIOD
         ).mean()
-        dataframe["volatility_ratio"] = (
-            dataframe["atr"] / dataframe["atr_baseline"]
-        ).clip(
+
+        # -----------------------------------------------------------------
+        # AUDIT FIX A (2026-09-05) — NaN-GUARD.
+        #
+        # atr_baseline is 0 or NaN for the first
+        # VOLATILITY_BASELINE_PERIOD-1 candles of any dataframe (the
+        # rolling window hasn't filled yet), and can also be exactly 0.0 in
+        # a genuinely flat/no-range market on some instruments. Dividing by
+        # that produces NaN or inf. The previous version's .clip() call
+        # does NOT sanitize a NaN — NaN survives .clip() unchanged, and
+        # every later ">" or ">=" comparison against a NaN is silently
+        # False in Python/NumPy, with no exception raised anywhere. In this
+        # file that would show up as: entry_adaptive_sl_pts becomes NaN on
+        # an early candle, and the widen-vs-tighten high-water-mark check
+        # in custom_stoploss ("if active_sl_pts > state['widest_sl_pts_seen']")
+        # would then permanently take the False branch for that trade —
+        # freezing the stop-loss logic with no error and no log line
+        # explaining why.
+        #
+        # Freqtrade's own startup_candle_count=60 (set below on this class)
+        # is what's SUPPOSED to prevent any live decision from ever seeing
+        # an unfilled rolling window — but that protection lives in a
+        # different setting entirely, and this file previously had no
+        # defense of its own if that assumption were ever violated (e.g. a
+        # future edit accidentally lowers startup_candle_count without
+        # realizing this dependency). Fixed by computing the ratio safely
+        # here, replacing any resulting NaN/inf with a neutral ratio of 1.0
+        # (i.e. "assume normal volatility" rather than silently propagating
+        # a poisoned value), THEN clipping as before.
+        # -----------------------------------------------------------------
+        raw_ratio = dataframe["atr"] / dataframe["atr_baseline"]
+        safe_ratio = raw_ratio.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        dataframe["volatility_ratio"] = safe_ratio.clip(
             lower=self.VOLATILITY_RATIO_CLAMP_MIN,
             upper=self.VOLATILITY_RATIO_CLAMP_MAX,
         )
@@ -760,6 +836,10 @@ class v12_Strategy(IStrategy):
                     "from Medium-tier wait (blueprint's Step-A/B/C freeze rule).",
                     pair, trade.id, vol_ratio,
                 )
+                # AUDIT FIX C (2026-09-05): remember which trade this wait
+                # produced, so confirm_trade_exit can clear it when THIS
+                # trade closes rather than leaving the dict entry forever.
+                wait_record["bound_trade_id"] = trade.id
             else:
                 vol_ratio = candle["volatility_ratio"]
 
@@ -826,7 +906,8 @@ class v12_Strategy(IStrategy):
             # --- Step 1: Volatility-Reassessment (widen OR tighten) -----
             checkpoint_vol_ratio = candle["volatility_ratio"]
             checkpoint_sl_pts = self.BASE_SL_TRENDING_PTS * checkpoint_vol_ratio
-            # already clamped via the dataframe's .clip() in populate_indicators
+            # already clamped via the dataframe's safe-ratio + .clip() in
+            # populate_indicators (see AUDIT FIX A above)
 
             # --- Step 2: IV-Crush Protective-Override -------------------
             # FIDELITY GAP #4: the blueprint's IV-trigger is an options-IV
@@ -1005,19 +1086,19 @@ class v12_Strategy(IStrategy):
         # was actively unsafe — a same-call follow-up could silently
         # override the direct write.
         #
-        # v2 (previous version of this file): stopped writing trade.stop_loss
-        # directly; instead set `_ft_stop_uses_after_fill = True` and relied
-        # on freqtrade's native allow_refresh=after_fill exception, believing
-        # it would cover Phase 3.5's widen case. Flagged UNVERIFIED at the
-        # time because freqtradebot.py wasn't available to confirm.
+        # v2: stopped writing trade.stop_loss directly; instead set
+        # `_ft_stop_uses_after_fill = True` and relied on freqtrade's native
+        # allow_refresh=after_fill exception, believing it would cover
+        # Phase 3.5's widen case. Flagged UNVERIFIED at the time because
+        # freqtradebot.py wasn't available to confirm.
         #
-        # v3 (this version): now confirmed against freqtrade 2026.8 source
-        # (freqtradebot.py) that after_fill=True fires exactly ONCE, at
-        # order-fill time — i.e. at trade OPEN, not 60s later. So v2's
-        # widen path was never actually reachable by the Phase 3.5
-        # checkpoint; every post-checkpoint call from the normal per-
-        # iteration path is after_fill=False, where freqtrade's own ratchet
-        # would silently re-tighten any genuine widen. Fixed by tracking
+        # v3: confirmed against freqtrade 2026.8 source (freqtradebot.py)
+        # that after_fill=True fires exactly ONCE, at order-fill time —
+        # i.e. at trade OPEN, not 60s later. So v2's widen path was never
+        # actually reachable by the Phase 3.5 checkpoint; every post-
+        # checkpoint call from the normal per-iteration path is
+        # after_fill=False, where freqtrade's own ratchet would silently
+        # re-tighten any genuine widen. Fixed by tracking
         # `widest_sl_pts_seen` on this trade's state (see the block right
         # after the Active-SL resolution above) and never returning a
         # ratio narrower than that high-water mark — this makes the widen
@@ -1026,6 +1107,12 @@ class v12_Strategy(IStrategy):
         # (harmless) but Phase 3.5's widen no longer depends on it.
         # `trade.stop_loss` is still never written directly; only a ratio
         # is returned below, same as v2.
+        #
+        # v4 (this revision, 2026-09-05 audit pass): no change to this
+        # block itself — re-verified the reasoning above still holds, and
+        # confirmed candidate_price can no longer be NaN-poisoned via
+        # active_sl_pts thanks to AUDIT FIX A upstream in
+        # populate_indicators.
         # -----------------------------------------------------------------
         stop_ratio = stoploss_from_absolute(
             candidate_price, current_rate, is_short=trade.is_short, leverage=trade.leverage
@@ -1078,7 +1165,7 @@ class v12_Strategy(IStrategy):
         return None
 
     # =====================================================================
-    # LEVERAGE — added on this review pass. GENUINELY MISSING before now.
+    # LEVERAGE — required override for futures mode.
     #
     # IStrategy's default leverage() (interface.py) hard-returns 1.0 and is
     # documented as "only called in futures mode." You are explicitly
@@ -1102,6 +1189,16 @@ class v12_Strategy(IStrategy):
     # product decision the blueprint doesn't make for you, and belongs
     # here if you want it; it is not implemented, to avoid inventing a
     # number on your behalf.
+    #
+    # AUDIT FIX B (2026-09-05): added an explicit floor. Previously this
+    # was a bare `min(proposed_leverage, max_leverage)` with no guard
+    # against a malformed 0 or negative proposed_leverage ever reaching a
+    # live order silently. Freqtrade's own call site shouldn't normally
+    # produce such a value, but "shouldn't" is not "can't" -- if it ever
+    # did, the strategy previously would have returned 0/negative leverage
+    # with zero indication anything was wrong. Now floors at 1.0 and logs
+    # loudly if the floor had to be applied, per Part 22's error-handling
+    # standard: fail loud, never silently swallow a malformed value.
     # =====================================================================
     def leverage(
         self,
@@ -1114,7 +1211,19 @@ class v12_Strategy(IStrategy):
         side: str,
         **kwargs,
     ) -> float:
-        return min(proposed_leverage, max_leverage)
+        resolved = min(proposed_leverage, max_leverage)
+        if resolved < 1.0:
+            logger.warning(
+                "[Leverage-Guard] %s: proposed_leverage=%.4f / max_leverage=%.4f "
+                "resolved to %.4f, below the 1.0 floor -- this should not "
+                "happen from Freqtrade's own call site and suggests a "
+                "misconfigured exchange/pair setting upstream. Flooring to "
+                "1.0 rather than silently placing a sub-1x/negative-leverage "
+                "order.",
+                pair, proposed_leverage, max_leverage, resolved,
+            )
+            return 1.0
+        return resolved
 
     # -------------------------------------------------------------------
     # WHERE'S THE "100% BALANCE PER TRADE" SETTING? Not in this file.
@@ -1201,6 +1310,21 @@ class v12_Strategy(IStrategy):
 
         # Clean up per-trade state now that the trade is closing.
         self._active_sl_state.pop(trade.id, None)
+
+        # -----------------------------------------------------------------
+        # AUDIT FIX C (2026-09-05): clean up the Medium-tier wait entry that
+        # was bound to THIS trade, if any, now that the trade is closing.
+        # Previously _medium_tier_wait entries were created and consumed
+        # in-place but never removed -- for a single-pair StaticPairList
+        # (this repo's actual deployed config) that meant exactly one
+        # stale dict key sitting in memory forever, which is harmless in
+        # practice here. But the code had no way of knowing it would only
+        # ever see one pair, and this fix makes it correct regardless of
+        # how many pairs pair_whitelist ever grows to hold.
+        # -----------------------------------------------------------------
+        wait_record = self._medium_tier_wait.get(pair)
+        if wait_record is not None and wait_record.get("bound_trade_id") == trade.id:
+            del self._medium_tier_wait[pair]
 
         return True
 
