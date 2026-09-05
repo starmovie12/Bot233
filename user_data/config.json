@@ -134,7 +134,7 @@
     "verbosity": "error",
     "enable_openapi": true,
     "jwt_secret_key": "CHANGE_ME_BEFORE_DEPLOY_random_string_here",
-    "CORS_origins": [],
+    "CORS_origins": ["*"],
     "username": "crown_admin",
     "password": "CHANGE_ME_BEFORE_DEPLOY"
   },
