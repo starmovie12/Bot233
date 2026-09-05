@@ -1117,7 +1117,17 @@ class v12_Strategy(IStrategy):
         stop_ratio = stoploss_from_absolute(
             candidate_price, current_rate, is_short=trade.is_short, leverage=trade.leverage
         )
-        return stop_ratio
+        # AUDIT FIX D (2026-09-06): candidate_price traces back to
+        # candle["volatility_ratio"], a native numpy.float64 pulled from the
+        # analyzed dataframe (see vol_ratio, lines ~833-844). That np.float64
+        # propagates through every arithmetic step above (entry_adaptive_sl_pts,
+        # active_sl_pts, candidate_price) and stoploss_from_absolute() performs
+        # no casting of its own, so stop_ratio itself is still np.float64 here.
+        # SQLAlchemy then serializes it as "np.float64(...)" when writing to
+        # Postgres, and Postgres reads the "np" prefix as a schema name it
+        # doesn't have — schema "np" does not exist. Explicit cast below is
+        # the fix: it converts the value only, changes no trading logic.
+        return float(stop_ratio)
 
     # =====================================================================
     # PHASE 3: Capital Shield — Time-Bomb exit.
