@@ -169,6 +169,68 @@
 #      no cross-asset consequence; it would need re-examining before ever
 #      adding a second, differently-priced pair to pair_whitelist.
 # =============================================================================
+# 2026-09-06 FEATURE ADDITION — Phase 1.5 SMC Structural Confirmation Gate.
+#
+# Added per a second blueprint doc you supplied
+# ("smc-phase-1.5-confirmation-gate.md"), which extracts four functions from
+# the `smart-money-concepts` package (github.com/joshyattridge/smart-money-
+# concepts, commit 1b62fd6c41e1f508e7ed76831a039fa4c82d42f6, package
+# v0.0.27, MIT License, Copyright (c) 2020 NeuralNine) and proposes gating
+# Phase 1.5's Trending breakout entries on Smart Money Concepts structure:
+# Fair Value Gaps (FVG), Break of Structure / Change of Character (BOS/
+# CHoCH, built on swing_highs_lows), and Order Blocks (OB). The stated goal
+# is to reject "retail-trap" breakouts — thin, one-sided pushes through a
+# level with no real displacement behind them — by requiring at least
+# SMC_MIN_CONFIRMATIONS of these 3 concepts to agree before a Trending
+# breakout is allowed through, stacked ON TOP OF (not merged into) the
+# existing ADX/DI/breakout-magnitude/tick-consistency tier gate above.
+#
+# All four functions (fvg, swing_highs_lows, bos_choch, ob) are ported
+# below, immediately before the class body, near-verbatim from the
+# blueprint doc — see that section's own comment block for the exact
+# changes made (only: @classmethod -> plain function, since none of the
+# four bodies ever reference `cls`) and for a real discrepancy this port
+# caught between the blueprint doc's own PROSE description of the FVG
+# function and what its CODE actually does — see "MITIGATEDINDEX
+# CORRECTION" in that section.
+#
+# NEW FIDELITY GAP #7 — SMC STRUCTURE IS FORWARD-LOOKING; IT REPAINTS AT THE
+# LIVE EDGE. This is the load-bearing caveat for this whole feature, stated
+# here up front and again inline at the point of the code:
+#
+#   swing_highs_lows() (which bos_choch() and ob() both depend on) decides
+#   whether candle i is a swing extreme by comparing it against a window
+#   that extends `swing_length` candles AFTER i, not just before — that is
+#   inherent to the algorithm, not an implementation slip (the blueprint
+#   doc says so explicitly: "the most recent swing_length/2 bars are
+#   provisional and will repaint as new candles arrive"). Consequence: at
+#   the exact instant a breakout candle closes — the only moment this
+#   strategy can act on it — zero future candles exist yet, so the
+#   breakout candle itself can essentially never carry a settled BOS/CHoCH/
+#   OB classification. This file does not paper over that with a fake
+#   same-candle check. Instead, BOS/CHoCH/OB confirmation below is
+#   evaluated as "was a same-direction, still-valid structural event
+#   confirmed somewhere in the last SMC_STRUCTURE_LOOKBACK_BARS candles" —
+#   corroborating recent structure, NOT a same-candle stamp of approval on
+#   the specific breakout being gated. FVG is less affected (it only needs
+#   ONE forward candle per gap, not a whole swing_length window) but the
+#   breakout candle's OWN FVG is still unknowable at decision time for the
+#   same reason, one candle short — handled by checking
+#   SMC_FVG_LOOKBACK_BARS candles immediately BEHIND the breakout instead
+#   of the breakout candle itself. See "PHASE 1.5 SMC EXTENSION" inside
+#   populate_indicators below for the full trace, and bos_choch()'s own
+#   additional retroactive-invalidation behavior (a confirmed BOS can later
+#   be wiped out by a subsequent overlapping one — see that function's own
+#   source comment, "if there are any unbroken bos or choch that started
+#   before this one and ended after this one then remove them") for a
+#   second, independent reason none of these columns are a stable, one-time
+#   stamp you can cache and trust forever.
+#
+# SMC_GATE_ENABLED (new class constant, default True) turns this entire
+# gate on/off without touching any other logic, specifically so you can A/B
+# test Trending-entry frequency and quality with and without it before
+# committing real capital to either configuration.
+# =============================================================================
 
 import logging
 import math
@@ -176,8 +238,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
+import pandas as pd  # ADDED 2026-09-06: the ported SMC functions below
+                      # (fvg/swing_highs_lows/bos_choch/ob) call pd.Series(...)
+                      # and pd.concat(...) throughout their bodies; only
+                      # `from pandas import DataFrame` existed before, which
+                      # would have raised NameError: name 'pd' is not defined
+                      # on the very first populate_indicators call.
 import talib.abstract as ta
-from pandas import DataFrame
+from pandas import DataFrame, Series  # Series ADDED: the ported functions'
+                                       # own `-> Series` return-type
+                                       # annotations need this name in scope
+                                       # at function-definition time, even
+                                       # though (see the SMC EXTRACTION
+                                       # section below) what they actually
+                                       # return is a multi-column DataFrame.
 
 from freqtrade.strategy import (
     IStrategy,
@@ -186,6 +260,600 @@ from freqtrade.strategy import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# SMC EXTRACTION — Phase 1.5 Structural Confirmation Gate.
+# Ported from smartmoneyconcepts/smc.py (github.com/joshyattridge/smart-
+# money-concepts, commit 1b62fd6c41e1f508e7ed76831a039fa4c82d42f6, package
+# v0.0.27, MIT License, Copyright (c) 2020 NeuralNine), via the
+# smc-phase-1.5-confirmation-gate.md reference doc you supplied. See the
+# "2026-09-06 FEATURE ADDITION" block in the file header for what this is
+# FOR and FIDELITY GAP #7 for what it does NOT guarantee.
+#
+# PORTING NOTES (what changed vs. the reference doc's code, and why):
+#
+#   - @classmethod -> plain module-level function, `cls` parameter dropped.
+#     None of the four bodies below ever reference `cls` — the source
+#     library only uses @classmethod to hang these on a shared `SMC`
+#     namespace class for its own public API; there is no actual class-
+#     level state involved, so this changes nothing about behavior. It
+#     also sidesteps needing "the two small decorators the class depends
+#     on" mentioned in the reference doc's companion .py file, which was
+#     not supplied to this session — the doc's OWN code block for each
+#     function shows no decorator besides @classmethod, so nothing else
+#     was actually load-bearing for these four functions specifically.
+#
+#   - Return-type annotations kept exactly as `-> Series`, even though
+#     every one of these functions actually returns a multi-column
+#     DataFrame (via pd.concat). This is a pre-existing quirk of the
+#     upstream library's own annotations, not something introduced here —
+#     left as-is rather than silently "corrected," consistent with
+#     treating this as a verified port of reviewed third-party source, not
+#     a rewrite.
+#
+#   - MITIGATEDINDEX CORRECTION (a real discrepancy this port caught): the
+#     reference doc's own PROSE says to gate on FVG "still unmitigated
+#     (MitigatedIndex is NaN)". Reading fvg()'s actual code below line by
+#     line: `mitigated_index` starts as `np.zeros(...)` and is ONLY
+#     overwritten (to the mitigating candle's index) inside
+#     `if np.any(mask):` — i.e. only once a real mitigation is found. If a
+#     gap never gets mitigated in the available data, its MitigatedIndex
+#     stays at its initialized value of 0 forever, and the function's
+#     closing line (`np.where(np.isnan(fvg), np.nan, mitigated_index)`)
+#     only inserts NaN where FVG ITSELF is NaN (no gap at all) — it never
+#     touches an unmitigated-but-real gap's MitigatedIndex back to NaN. So
+#     for any row where a gap exists (FVG is 1 or -1), "still open" is
+#     `MitigatedIndex == 0`, NOT `MitigatedIndex` being NaN — a real
+#     mitigation index can never legitimately come out as 0 (it's always
+#     `j = np.argmax(mask) + i + 2 >= i + 2 >= 2`), so 0 can't be confused
+#     with a genuine mitigation. This file's gate logic in
+#     populate_indicators below uses the CORRECT test
+#     (`(FVG == direction) & (MitigatedIndex == 0)`) — if you reuse these
+#     functions elsewhere, don't copy the doc's "MitigatedIndex is NaN"
+#     phrasing literally.
+#
+#   - Both `bos_choch()` and `ob()` take a parameter also named
+#     `swing_highs_lows`, which shadows this module's own
+#     `swing_highs_lows()` function by name inside those two functions'
+#     bodies. This is exactly as given in the source and is harmless —
+#     neither function calls the module-level `swing_highs_lows()` itself;
+#     each only consumes its pre-computed OUTPUT, passed in by the caller
+#     (see populate_indicators below). Flagged so it doesn't read as a bug
+#     on a future pass.
+#
+#   - `ob()`'s body also has a local variable named `ob`, shadowing the
+#     function's own name inside its own body. Also exactly as given, also
+#     harmless — there's no recursion here, so a function has no need to
+#     reference its own name from inside itself.
+#
+#   - All four functions assume `ohlc` has a plain 0..N-1 positional index
+#     — they slice with bracket notation like `ohlc["low"][i + 2 :]`,
+#     which is LABEL-based on the Series' own index, and only matches
+#     "from position i+2 onward" if that index already IS 0..N-1.
+#     Freqtrade dataframes are exactly that by default and nothing else in
+#     this file re-indexes them, but populate_indicators below still
+#     defensively `.reset_index(drop=True)`s a throwaway copy before
+#     calling into these functions, so this dependency can never be
+#     silently violated by some future upstream change elsewhere in the
+#     pipeline.
+# =============================================================================
+
+
+def fvg(ohlc: DataFrame, join_consecutive=False) -> Series:
+    """
+    FVG - Fair Value Gap
+    A fair value gap is when the previous high is lower than the next low if the current candle is bullish.
+    Or when the previous low is higher than the next high if the current candle is bearish.
+
+    parameters:
+    join_consecutive: bool - if there are multiple FVG in a row then they will be merged into one using the highest top and the lowest bottom
+
+    returns:
+    FVG = 1 if bullish fair value gap, -1 if bearish fair value gap
+    Top = the top of the fair value gap
+    Bottom = the bottom of the fair value gap
+    MitigatedIndex = the index of the candle that mitigated the fair value gap
+    """
+
+    fvg = np.where(
+        (
+            (ohlc["high"].shift(1) < ohlc["low"].shift(-1))
+            & (ohlc["close"] > ohlc["open"])
+        )
+        | (
+            (ohlc["low"].shift(1) > ohlc["high"].shift(-1))
+            & (ohlc["close"] < ohlc["open"])
+        ),
+        np.where(ohlc["close"] > ohlc["open"], 1, -1),
+        np.nan,
+    )
+
+    top = np.where(
+        ~np.isnan(fvg),
+        np.where(
+            ohlc["close"] > ohlc["open"],
+            ohlc["low"].shift(-1),
+            ohlc["low"].shift(1),
+        ),
+        np.nan,
+    )
+
+    bottom = np.where(
+        ~np.isnan(fvg),
+        np.where(
+            ohlc["close"] > ohlc["open"],
+            ohlc["high"].shift(1),
+            ohlc["high"].shift(-1),
+        ),
+        np.nan,
+    )
+
+    # if there are multiple consecutive fvg then join them together using the highest top and lowest bottom and the last index
+    if join_consecutive:
+        for i in range(len(fvg) - 1):
+            if fvg[i] == fvg[i + 1]:
+                top[i + 1] = max(top[i], top[i + 1])
+                bottom[i + 1] = min(bottom[i], bottom[i + 1])
+                fvg[i] = top[i] = bottom[i] = np.nan
+
+    mitigated_index = np.zeros(len(ohlc), dtype=np.int32)
+    for i in np.where(~np.isnan(fvg))[0]:
+        mask = np.zeros(len(ohlc), dtype=np.bool_)
+        if fvg[i] == 1:
+            mask = ohlc["low"][i + 2 :] <= top[i]
+        elif fvg[i] == -1:
+            mask = ohlc["high"][i + 2 :] >= bottom[i]
+        if np.any(mask):
+            j = np.argmax(mask) + i + 2
+            mitigated_index[i] = j
+
+    mitigated_index = np.where(np.isnan(fvg), np.nan, mitigated_index)
+
+    return pd.concat(
+        [
+            pd.Series(fvg, name="FVG"),
+            pd.Series(top, name="Top"),
+            pd.Series(bottom, name="Bottom"),
+            pd.Series(mitigated_index, name="MitigatedIndex"),
+        ],
+        axis=1,
+    )
+
+
+def swing_highs_lows(ohlc: DataFrame, swing_length: int = 50) -> Series:
+    """
+    Swing Highs and Lows
+    A swing high is when the current high is the highest high out of the swing_length amount of candles before and after.
+    A swing low is when the current low is the lowest low out of the swing_length amount of candles before and after.
+
+    parameters:
+    swing_length: int - the amount of candles to look back and forward to determine the swing high or low
+
+    returns:
+    HighLow = 1 if swing high, -1 if swing low
+    Level = the level of the swing high or low
+    """
+
+    swing_length *= 2
+    # set the highs to 1 if the current high is the highest high in the last 5 candles and next 5 candles
+    swing_highs_lows = np.where(
+        ohlc["high"]
+        == ohlc["high"].shift(-(swing_length // 2)).rolling(swing_length).max(),
+        1,
+        np.where(
+            ohlc["low"]
+            == ohlc["low"].shift(-(swing_length // 2)).rolling(swing_length).min(),
+            -1,
+            np.nan,
+        ),
+    )
+
+    while True:
+        positions = np.where(~np.isnan(swing_highs_lows))[0]
+
+        if len(positions) < 2:
+            break
+
+        current = swing_highs_lows[positions[:-1]]
+        next = swing_highs_lows[positions[1:]]
+
+        highs = ohlc["high"].iloc[positions[:-1]].values
+        lows = ohlc["low"].iloc[positions[:-1]].values
+
+        next_highs = ohlc["high"].iloc[positions[1:]].values
+        next_lows = ohlc["low"].iloc[positions[1:]].values
+
+        index_to_remove = np.zeros(len(positions), dtype=bool)
+
+        consecutive_highs = (current == 1) & (next == 1)
+        index_to_remove[:-1] |= consecutive_highs & (highs < next_highs)
+        index_to_remove[1:] |= consecutive_highs & (highs >= next_highs)
+
+        consecutive_lows = (current == -1) & (next == -1)
+        index_to_remove[:-1] |= consecutive_lows & (lows > next_lows)
+        index_to_remove[1:] |= consecutive_lows & (lows <= next_lows)
+
+        if not index_to_remove.any():
+            break
+
+        swing_highs_lows[positions[index_to_remove]] = np.nan
+
+    positions = np.where(~np.isnan(swing_highs_lows))[0]
+
+    if len(positions) > 0:
+        if swing_highs_lows[positions[0]] == 1:
+            swing_highs_lows[0] = -1
+        if swing_highs_lows[positions[0]] == -1:
+            swing_highs_lows[0] = 1
+        if swing_highs_lows[positions[-1]] == -1:
+            swing_highs_lows[-1] = 1
+        if swing_highs_lows[positions[-1]] == 1:
+            swing_highs_lows[-1] = -1
+
+    level = np.where(
+        ~np.isnan(swing_highs_lows),
+        np.where(swing_highs_lows == 1, ohlc["high"], ohlc["low"]),
+        np.nan,
+    )
+
+    return pd.concat(
+        [
+            pd.Series(swing_highs_lows, name="HighLow"),
+            pd.Series(level, name="Level"),
+        ],
+        axis=1,
+    )
+
+
+def bos_choch(
+    ohlc: DataFrame, swing_highs_lows: DataFrame, close_break: bool = True
+) -> Series:
+    """
+    BOS - Break of Structure
+    CHoCH - Change of Character
+    these are both indications of market structure changing
+
+    parameters:
+    swing_highs_lows: DataFrame - provide the dataframe from the swing_highs_lows function
+    close_break: bool - if True then the break of structure will be mitigated based on the close of the candle otherwise it will be the high/low.
+
+    returns:
+    BOS = 1 if bullish break of structure, -1 if bearish break of structure
+    CHOCH = 1 if bullish change of character, -1 if bearish change of character
+    Level = the level of the break of structure or change of character
+    BrokenIndex = the index of the candle that broke the level
+    """
+
+    swing_highs_lows = swing_highs_lows.copy()
+
+    level_order = []
+    highs_lows_order = []
+
+    bos = np.zeros(len(ohlc), dtype=np.int32)
+    choch = np.zeros(len(ohlc), dtype=np.int32)
+    level = np.zeros(len(ohlc), dtype=np.float32)
+
+    last_positions = []
+
+    for i in range(len(swing_highs_lows["HighLow"])):
+        if not np.isnan(swing_highs_lows["HighLow"][i]):
+            level_order.append(swing_highs_lows["Level"][i])
+            highs_lows_order.append(swing_highs_lows["HighLow"][i])
+            if len(level_order) >= 4:
+                # bullish bos
+                bos[last_positions[-2]] = (
+                    1
+                    if (
+                        np.all(highs_lows_order[-4:] == [-1, 1, -1, 1])
+                        and np.all(
+                            level_order[-4]
+                            < level_order[-2]
+                            < level_order[-3]
+                            < level_order[-1]
+                        )
+                    )
+                    else 0
+                )
+                level[last_positions[-2]] = (
+                    level_order[-3] if bos[last_positions[-2]] != 0 else 0
+                )
+
+                # bearish bos
+                bos[last_positions[-2]] = (
+                    -1
+                    if (
+                        np.all(highs_lows_order[-4:] == [1, -1, 1, -1])
+                        and np.all(
+                            level_order[-4]
+                            > level_order[-2]
+                            > level_order[-3]
+                            > level_order[-1]
+                        )
+                    )
+                    else bos[last_positions[-2]]
+                )
+                level[last_positions[-2]] = (
+                    level_order[-3] if bos[last_positions[-2]] != 0 else 0
+                )
+
+                # bullish choch
+                choch[last_positions[-2]] = (
+                    1
+                    if (
+                        np.all(highs_lows_order[-4:] == [-1, 1, -1, 1])
+                        and np.all(
+                            level_order[-1]
+                            > level_order[-3]
+                            > level_order[-4]
+                            > level_order[-2]
+                        )
+                    )
+                    else 0
+                )
+                level[last_positions[-2]] = (
+                    level_order[-3]
+                    if choch[last_positions[-2]] != 0
+                    else level[last_positions[-2]]
+                )
+
+                # bearish choch
+                choch[last_positions[-2]] = (
+                    -1
+                    if (
+                        np.all(highs_lows_order[-4:] == [1, -1, 1, -1])
+                        and np.all(
+                            level_order[-1]
+                            < level_order[-3]
+                            < level_order[-4]
+                            < level_order[-2]
+                        )
+                    )
+                    else choch[last_positions[-2]]
+                )
+                level[last_positions[-2]] = (
+                    level_order[-3]
+                    if choch[last_positions[-2]] != 0
+                    else level[last_positions[-2]]
+                )
+
+            last_positions.append(i)
+
+    broken = np.zeros(len(ohlc), dtype=np.int32)
+    for i in np.where(np.logical_or(bos != 0, choch != 0))[0]:
+        mask = np.zeros(len(ohlc), dtype=np.bool_)
+        # if the bos is 1 then check if the candles high has gone above the level
+        if bos[i] == 1 or choch[i] == 1:
+            mask = ohlc["close" if close_break else "high"][i + 2 :] > level[i]
+        # if the bos is -1 then check if the candles low has gone below the level
+        elif bos[i] == -1 or choch[i] == -1:
+            mask = ohlc["close" if close_break else "low"][i + 2 :] < level[i]
+        if np.any(mask):
+            j = np.argmax(mask) + i + 2
+            broken[i] = j
+            # if there are any unbroken bos or choch that started before this one and ended after this one then remove them
+            for k in np.where(np.logical_or(bos != 0, choch != 0))[0]:
+                if k < i and broken[k] >= j:
+                    bos[k] = 0
+                    choch[k] = 0
+                    level[k] = 0
+
+    # remove the ones that aren't broken
+    for i in np.where(
+        np.logical_and(np.logical_or(bos != 0, choch != 0), broken == 0)
+    )[0]:
+        bos[i] = 0
+        choch[i] = 0
+        level[i] = 0
+
+    # replace all the 0s with np.nan
+    bos = np.where(bos != 0, bos, np.nan)
+    choch = np.where(choch != 0, choch, np.nan)
+    level = np.where(level != 0, level, np.nan)
+    broken = np.where(broken != 0, broken, np.nan)
+
+    bos = pd.Series(bos, name="BOS")
+    choch = pd.Series(choch, name="CHOCH")
+    level = pd.Series(level, name="Level")
+    broken = pd.Series(broken, name="BrokenIndex")
+
+    return pd.concat([bos, choch, level, broken], axis=1)
+
+
+def ob(
+    ohlc: DataFrame,
+    swing_highs_lows: DataFrame,
+    close_mitigation: bool = False,
+) -> Series:
+    """
+    OB - Order Blocks
+    This method detects order blocks when there is a high amount of market orders exist on a price range.
+
+    parameters:
+    swing_highs_lows: DataFrame - provide the dataframe from the swing_highs_lows function
+    close_mitigation: bool - if True then the order block will be mitigated based on the close of the candle otherwise it will be the high/low.
+
+    returns:
+    OB = 1 if bullish order block, -1 if bearish order block
+    Top = top of the order block
+    Bottom = bottom of the order block
+    OBVolume = volume + 2 last volumes amounts
+    Percentage = strength of order block (min(highVolume, lowVolume)/max(highVolume, lowVolume))
+    """
+
+    ohlc_len = len(ohlc)
+    _open = ohlc["open"].values
+    _high = ohlc["high"].values
+    _low = ohlc["low"].values
+    _close = ohlc["close"].values
+    _volume = ohlc["volume"].values
+    swing_hl = swing_highs_lows["HighLow"].values
+
+    # Pre-allocate arrays
+    crossed = np.full(ohlc_len, False, dtype=bool)
+    ob = np.zeros(ohlc_len, dtype=np.int32)
+    top_arr = np.zeros(ohlc_len, dtype=np.float32)
+    bottom_arr = np.zeros(ohlc_len, dtype=np.float32)
+    obVolume = np.zeros(ohlc_len, dtype=np.float32)
+    lowVolume = np.zeros(ohlc_len, dtype=np.float32)
+    highVolume = np.zeros(ohlc_len, dtype=np.float32)
+    percentage = np.zeros(ohlc_len, dtype=np.float32)
+    mitigated_index = np.zeros(ohlc_len, dtype=np.int32)
+    breaker = np.full(ohlc_len, False, dtype=bool)
+
+    # Precompute swing indices (assumed sorted)
+    swing_high_indices = np.flatnonzero(swing_hl == 1)
+    swing_low_indices = np.flatnonzero(swing_hl == -1)
+
+    # List to track active bullish order blocks
+    active_bullish = []
+    for i in range(ohlc_len):
+        close_index = i
+        # Update existing bullish OB
+        for idx in active_bullish.copy():
+            if breaker[idx]:
+                if _high[close_index] > top_arr[idx]:
+                    # Reset this OB
+                    ob[idx] = 0
+                    top_arr[idx] = 0.0
+                    bottom_arr[idx] = 0.0
+                    obVolume[idx] = 0.0
+                    lowVolume[idx] = 0.0
+                    highVolume[idx] = 0.0
+                    mitigated_index[idx] = 0
+                    percentage[idx] = 0.0
+                    active_bullish.remove(idx)
+            else:
+                if ((not close_mitigation and _low[close_index] < bottom_arr[idx])
+                    or (close_mitigation and min(_open[close_index], _close[close_index]) < bottom_arr[idx])):
+                    breaker[idx] = True
+                    mitigated_index[idx] = close_index - 1
+
+        # Find last swing high index less than current candle (using binary search)
+        pos = np.searchsorted(swing_high_indices, close_index)
+        last_top_index = swing_high_indices[pos - 1] if pos > 0 else None
+
+        if last_top_index is not None:
+            if _close[close_index] > _high[last_top_index] and not crossed[last_top_index]:
+                crossed[last_top_index] = True
+                # Initialise with default values from previous candle
+                default_index = close_index - 1
+                obBtm = _high[default_index]
+                obTop = _low[default_index]
+                obIndex = default_index
+                # Look for a lower low between last_top_index and current candle
+                if close_index - last_top_index > 1:
+                    start = last_top_index + 1
+                    end = close_index  # up to but not including close_index
+                    if end > start:
+                        segment = _low[start:end]
+                        min_val = segment.min()
+                        # In case of ties, take the last occurrence
+                        candidates = np.nonzero(segment == min_val)[0]
+                        if candidates.size:
+                            candidate_index = start + candidates[-1]
+                            obBtm = _low[candidate_index]
+                            obTop = _high[candidate_index]
+                            obIndex = candidate_index
+                # Set bullish OB values
+                ob[obIndex] = 1
+                top_arr[obIndex] = obTop
+                bottom_arr[obIndex] = obBtm
+                vol_cur = _volume[close_index]
+                vol_prev1 = _volume[close_index - 1] if close_index >= 1 else 0.0
+                vol_prev2 = _volume[close_index - 2] if close_index >= 2 else 0.0
+                obVolume[obIndex] = vol_cur + vol_prev1 + vol_prev2
+                lowVolume[obIndex] = vol_prev2
+                highVolume[obIndex] = vol_cur + vol_prev1
+                max_vol = max(highVolume[obIndex], lowVolume[obIndex])
+                percentage[obIndex] = (min(highVolume[obIndex], lowVolume[obIndex]) / max_vol * 100.0) if max_vol != 0 else 100.0
+                active_bullish.append(obIndex)
+
+    # List to track active bearish order blocks
+    active_bearish = []
+    for i in range(ohlc_len):
+        close_index = i
+        # Update existing bearish OB
+        for idx in active_bearish.copy():
+            if breaker[idx]:
+                if _low[close_index] < bottom_arr[idx]:
+                    ob[idx] = 0
+                    top_arr[idx] = 0.0
+                    bottom_arr[idx] = 0.0
+                    obVolume[idx] = 0.0
+                    lowVolume[idx] = 0.0
+                    highVolume[idx] = 0.0
+                    mitigated_index[idx] = 0
+                    percentage[idx] = 0.0
+                    active_bearish.remove(idx)
+            else:
+                if ((not close_mitigation and _high[close_index] > top_arr[idx])
+                    or (close_mitigation and max(_open[close_index], _close[close_index]) > top_arr[idx])):
+                    breaker[idx] = True
+                    mitigated_index[idx] = close_index
+
+        # Find last swing low index less than current candle
+        pos = np.searchsorted(swing_low_indices, close_index)
+        last_btm_index = swing_low_indices[pos - 1] if pos > 0 else None
+
+        if last_btm_index is not None:
+            if _close[close_index] < _low[last_btm_index] and not crossed[last_btm_index]:
+                crossed[last_btm_index] = True
+                default_index = close_index - 1
+                obTop = _high[default_index]
+                obBtm = _low[default_index]
+                obIndex = default_index
+                if close_index - last_btm_index > 1:
+                    start = last_btm_index + 1
+                    end = close_index
+                    if end > start:
+                        segment = _high[start:end]
+                        max_val = segment.max()
+                        candidates = np.nonzero(segment == max_val)[0]
+                        if candidates.size:
+                            candidate_index = start + candidates[-1]
+                            obTop = _high[candidate_index]
+                            obBtm = _low[candidate_index]
+                            obIndex = candidate_index
+                ob[obIndex] = -1
+                top_arr[obIndex] = obTop
+                bottom_arr[obIndex] = obBtm
+                vol_cur = _volume[close_index]
+                vol_prev1 = _volume[close_index - 1] if close_index >= 1 else 0.0
+                vol_prev2 = _volume[close_index - 2] if close_index >= 2 else 0.0
+                obVolume[obIndex] = vol_cur + vol_prev1 + vol_prev2
+                lowVolume[obIndex] = vol_cur + vol_prev1
+                highVolume[obIndex] = vol_prev2
+                max_vol = max(highVolume[obIndex], lowVolume[obIndex])
+                percentage[obIndex] = (min(highVolume[obIndex], lowVolume[obIndex]) / max_vol * 100.0) if max_vol != 0 else 100.0
+                active_bearish.append(obIndex)
+
+    # Convert zeros to NaN where OB was not set
+    ob = np.where(ob != 0, ob, np.nan)
+    top_arr = np.where(~np.isnan(ob), top_arr, np.nan)
+    bottom_arr = np.where(~np.isnan(ob), bottom_arr, np.nan)
+    obVolume = np.where(~np.isnan(ob), obVolume, np.nan)
+    mitigated_index = np.where(~np.isnan(ob), mitigated_index, np.nan)
+    percentage = np.where(~np.isnan(ob), percentage, np.nan)
+
+    ob_series = pd.Series(ob, name="OB")
+    top_series = pd.Series(top_arr, name="Top")
+    bottom_series = pd.Series(bottom_arr, name="Bottom")
+    obVolume_series = pd.Series(obVolume, name="OBVolume")
+    mitigated_index_series = pd.Series(mitigated_index, name="MitigatedIndex")
+    percentage_series = pd.Series(percentage, name="Percentage")
+
+    return pd.concat(
+        [
+            ob_series,
+            top_series,
+            bottom_series,
+            obVolume_series,
+            mitigated_index_series,
+            percentage_series,
+        ],
+        axis=1,
+    )
 
 
 class v12_Strategy(IStrategy):
@@ -317,6 +985,58 @@ class v12_Strategy(IStrategy):
     MEDIUM_TIER_WAIT_CYCLES = 2  # "1-2 extra polling cycles" -> upper bound.
                                   # See FIDELITY GAP #1: this is iterations of
                                   # the bot loop, not ticks.
+
+    # --- Phase 1.5 (SMC Extension): Structural Confirmation Gate --------
+    # See "2026-09-06 FEATURE ADDITION" in the file header and FIDELITY
+    # GAP #7 for what this does and does NOT guarantee. Every value below
+    # is untested, same as everything else in this section — these are
+    # new invented starting points, not blueprint-specified numbers (the
+    # smc-phase-1.5-confirmation-gate.md doc never proposes concrete
+    # thresholds; it names the concepts and leaves calibration to you).
+    SMC_GATE_ENABLED = True  # False = the diagnostic columns below still
+                              # populate normally, but they can never block
+                              # a Trending entry — use this to A/B the
+                              # tier-gate-only vs. tier-gate+SMC-gate
+                              # configurations against each other.
+    SMC_SWING_LENGTH = 5  # candles each side, fed to swing_highs_lows().
+                            # Deliberately far below the smc library's own
+                            # default of 50: every candle of swing_length
+                            # is a candle of forward data this strategy
+                            # cannot have yet at decision time (Gap #7), so
+                            # this is a starting point for the smallest
+                            # window that still produces a recognizable
+                            # swing/BOS/OB structure, traded off against
+                            # noisier, less structurally significant
+                            # "swings" than the library's own tested
+                            # default would produce. Re-tune this
+                            # explicitly before trusting the gate.
+    SMC_STRUCTURE_LOOKBACK_BARS = 15  # how far back (in candles) to scan
+                            # for a still-valid, already-confirmed BOS or
+                            # active Order Block. Kept at roughly
+                            # 3x SMC_SWING_LENGTH: a settled swing needs
+                            # ~SMC_SWING_LENGTH candles just to stop being
+                            # provisional (Gap #7), and BOS/CHoCH's own
+                            # break-confirmation needs an unbounded,
+                            # variable number MORE candles on top of that —
+                            # 3x is a heuristic margin, not a derived or
+                            # guaranteed-sufficient figure.
+    SMC_FVG_LOOKBACK_BARS = 2  # how many candles immediately BEHIND the
+                            # breakout candle to scan for an unmitigated,
+                            # same-direction FVG. Deliberately excludes the
+                            # breakout candle's own (unshifted) FVG value —
+                            # that value structurally cannot exist yet at
+                            # decision time, per Gap #7 — only shift(1)..
+                            # shift(SMC_FVG_LOOKBACK_BARS) are checked.
+    SMC_OB_MIN_PERCENTAGE = 60.0  # ob()'s Percentage field (0-100,
+                            # min(highVolume,lowVolume)/max(...)*100 across
+                            # the 3 candles around the breakout that
+                            # created the block) must clear this to count
+                            # as a genuine, two-sided-enough push per the
+                            # blueprint's "a low score flags a thin,
+                            # one-sided push" framing.
+    SMC_MIN_CONFIRMATIONS = 2  # of 3 (FVG, BOS, OB) required to pass the
+                            # gate — the blueprint's own "2-of-3 (or all 3)"
+                            # framing. Set to 3 for the strictest reading.
 
     # --- Phase 2: Position Sizing (Trending) ----------------------------
     SIZING_ADX_HIGH = 30.0
@@ -518,6 +1238,154 @@ class v12_Strategy(IStrategy):
             .sum()
             == 3
         )
+
+        # -----------------------------------------------------------------
+        # PHASE 1.5 SMC EXTENSION (2026-09-06 feature addition): Fair Value
+        # Gaps, swing-based Break of Structure / Change of Character, and
+        # Order Blocks — see the "2026-09-06 FEATURE ADDITION" header block
+        # and FIDELITY GAP #7 for what this is for and its load-bearing
+        # repainting caveat. Computed here (not a separate method) so it
+        # follows the same per-candle vectorized pattern as every other
+        # indicator in this method, and so the gate columns below are
+        # available to populate_entry_trend on the same dataframe pass.
+        #
+        # Defensive copy with a reset index: the four ported SMC functions
+        # slice by bracket-notation position (e.g. ohlc["low"][i + 2 :]),
+        # which is label-based and only matches "from position i+2" if the
+        # Series' index is already a plain 0..N-1 range. Freqtrade
+        # dataframes are exactly that by default, and nothing upstream in
+        # THIS file changes it — but this copy makes that assumption
+        # impossible to silently violate rather than trusting it forever.
+        # -----------------------------------------------------------------
+        _smc_input = dataframe[["open", "high", "low", "close", "volume"]].reset_index(
+            drop=True
+        )
+        _smc_swing = swing_highs_lows(_smc_input, swing_length=self.SMC_SWING_LENGTH)
+        _smc_bos = bos_choch(_smc_input, _smc_swing, close_break=True)
+        _smc_ob = ob(_smc_input, _smc_swing, close_mitigation=False)
+        _smc_fvg = fvg(_smc_input, join_consecutive=False)
+
+        # Raw columns, assigned by position (.values) rather than by index,
+        # so this is correct regardless of what index `dataframe` itself
+        # carries — see the reset_index note above.
+        dataframe["smc_swing_hl"] = _smc_swing["HighLow"].values
+        dataframe["smc_swing_level"] = _smc_swing["Level"].values
+        dataframe["smc_bos"] = _smc_bos["BOS"].values
+        # smc_choch is stored for visibility only and intentionally NOT
+        # wired into the pass/fail gate below: the blueprint doc's own
+        # "Summary — stacking the gate" table lists FVG/BOS/OB as the 3
+        # gate inputs and explicitly routes CHoCH as "a reversal warning,
+        # not a breakout signal" rather than as a 4th confirmation or a
+        # veto. Using it as a veto (e.g. blocking a long breakout if a
+        # bearish CHoCH just printed) is a reasonable future extension but
+        # is not what was specified here, so it isn't invented on your
+        # behalf — the column is available if you want to add that later.
+        dataframe["smc_choch"] = _smc_bos["CHOCH"].values
+        dataframe["smc_ob"] = _smc_ob["OB"].values
+        dataframe["smc_ob_percentage"] = _smc_ob["Percentage"].values
+        dataframe["smc_fvg"] = _smc_fvg["FVG"].values
+        dataframe["smc_fvg_mitigated_index"] = _smc_fvg["MitigatedIndex"].values
+
+        # --- FVG confirmation: unmitigated, same-direction gap in the last
+        # SMC_FVG_LOOKBACK_BARS candles BEHIND the breakout candle. Never
+        # checks the breakout candle's own (unshifted) FVG value — that
+        # value needs one candle of forward data that cannot exist yet at
+        # decision time (Gap #7). MITIGATEDINDEX CORRECTION (see the SMC
+        # EXTRACTION section above fvg()'s definition): "still open" is
+        # `== 0`, not `.isna()`.
+        smc_fvg_confirms_long = pd.Series(False, index=dataframe.index)
+        smc_fvg_confirms_short = pd.Series(False, index=dataframe.index)
+        for _smc_k in range(1, self.SMC_FVG_LOOKBACK_BARS + 1):
+            _fvg_shift = dataframe["smc_fvg"].shift(_smc_k)
+            _mit_shift = dataframe["smc_fvg_mitigated_index"].shift(_smc_k)
+            smc_fvg_confirms_long = smc_fvg_confirms_long | (
+                (_fvg_shift == 1) & (_mit_shift == 0)
+            )
+            smc_fvg_confirms_short = smc_fvg_confirms_short | (
+                (_fvg_shift == -1) & (_mit_shift == 0)
+            )
+        dataframe["smc_fvg_confirms_long"] = smc_fvg_confirms_long
+        dataframe["smc_fvg_confirms_short"] = smc_fvg_confirms_short
+
+        # --- BOS confirmation: a same-direction BOS (never CHOCH — see the
+        # comment on smc_choch above) confirmed anywhere in the last
+        # SMC_STRUCTURE_LOOKBACK_BARS candles. This is corroborating recent
+        # structure, NOT a same-candle stamp on this specific breakout —
+        # see Gap #7. .astype(int) before .rolling(...).max() (not a bare
+        # bool Series) so an under-filled window at the very start of a
+        # dataframe returns a real 0/1 via min_periods=1 rather than a NaN
+        # that .astype(bool) would silently turn into True (NaN is
+        # truthy) — the same class of NaN-poisoning AUDIT FIX A already
+        # guards against elsewhere in this file, just NaN-to-True instead
+        # of NaN-to-always-False.
+        dataframe["smc_bos_confirms_long"] = (
+            (dataframe["smc_bos"] == 1)
+            .astype(int)
+            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .max()
+            .astype(bool)
+        )
+        dataframe["smc_bos_confirms_short"] = (
+            (dataframe["smc_bos"] == -1)
+            .astype(int)
+            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .max()
+            .astype(bool)
+        )
+
+        # --- OB confirmation: an active (not yet invalidated back to NaN —
+        # ob() re-derives this from scratch on every populate_indicators
+        # call, so an already-invalidated block simply won't show as
+        # 1/-1 anymore) order block, above the Percentage floor, present
+        # anywhere in the last SMC_STRUCTURE_LOOKBACK_BARS candles. Same
+        # corroborating-structure caveat and NaN-guard as BOS above.
+        _smc_ob_bull_strong = (dataframe["smc_ob"] == 1) & (
+            dataframe["smc_ob_percentage"] >= self.SMC_OB_MIN_PERCENTAGE
+        )
+        _smc_ob_bear_strong = (dataframe["smc_ob"] == -1) & (
+            dataframe["smc_ob_percentage"] >= self.SMC_OB_MIN_PERCENTAGE
+        )
+        dataframe["smc_ob_confirms_long"] = (
+            _smc_ob_bull_strong.astype(int)
+            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .max()
+            .astype(bool)
+        )
+        dataframe["smc_ob_confirms_short"] = (
+            _smc_ob_bear_strong.astype(int)
+            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .max()
+            .astype(bool)
+        )
+
+        # --- Combine: the blueprint's "2-of-3 (or all 3)" gate. Purely a
+        # binary pre-filter on top of the existing tier system below, NOT
+        # a replacement for it and NOT itself tiered — see the "2026-09-06
+        # FEATURE ADDITION" header block for why this file keeps the two
+        # mechanisms separate rather than merging them.
+        dataframe["smc_confirmation_count_long"] = (
+            dataframe["smc_fvg_confirms_long"].astype(int)
+            + dataframe["smc_bos_confirms_long"].astype(int)
+            + dataframe["smc_ob_confirms_long"].astype(int)
+        )
+        dataframe["smc_confirmation_count_short"] = (
+            dataframe["smc_fvg_confirms_short"].astype(int)
+            + dataframe["smc_bos_confirms_short"].astype(int)
+            + dataframe["smc_ob_confirms_short"].astype(int)
+        )
+        if self.SMC_GATE_ENABLED:
+            dataframe["smc_gate_passed_long"] = (
+                dataframe["smc_confirmation_count_long"] >= self.SMC_MIN_CONFIRMATIONS
+            )
+            dataframe["smc_gate_passed_short"] = (
+                dataframe["smc_confirmation_count_short"] >= self.SMC_MIN_CONFIRMATIONS
+            )
+        else:
+            # SMC_GATE_ENABLED=False: the diagnostic columns above still
+            # populate normally (so you can inspect/tune before switching
+            # this on), but the gate itself becomes a permissive no-op.
+            dataframe["smc_gate_passed_long"] = True
+            dataframe["smc_gate_passed_short"] = True
 
         return dataframe
 
