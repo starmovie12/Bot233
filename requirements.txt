@@ -17,9 +17,20 @@
 # want to move to a newer Freqtrade version later, that upgrade should be a
 # deliberate choice — re-verify the ratchet behavior against the new
 # version's freqtradebot.py before trusting Phase 3.5's widen logic again.
+#
+# ADDED (2026-09-05): psycopg2-binary. Your db_url in config.json points at
+# a Neon PostgreSQL database, but SQLAlchemy needs a Postgres driver
+# installed to actually connect to it — that driver was never in this file,
+# so the crash "ModuleNotFoundError: No module named 'psycopg2'" only
+# surfaced once the earlier exchange config error was fixed and the boot
+# sequence reached the database-init step. Using the '-binary' package
+# (bundles its own C library, no separate system-level Postgres install
+# needed) rather than plain 'psycopg2', since that's the simpler fit for a
+# container build like this one.
 # =============================================================================
 
 freqtrade==2026.8
 pandas==3.0.2
 numpy==2.4.4
 TA-Lib==0.7.1
+psycopg2-binary==2.9.10
