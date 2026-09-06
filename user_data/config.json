@@ -165,7 +165,85 @@
     "jwt_secret_key": "CHANGE_ME_BEFORE_DEPLOY_random_string_here",
     "CORS_origins": ["*"],
     "username": "crown_admin",
-    "password": "CHANGE_ME_BEFORE_DEPLOY"
+    "password": "CHANGE_ME_BEFORE_DEPLOY",
+    "ws_token": "CHANGE_ME_BEFORE_DEPLOY_ws_token_run_python_-c_import_secrets;print(secrets.token_urlsafe(25))"
+  },
+
+  "$comment_ws": "----- WEBSOCKET — there is no separate 'enable websocket' flag ---",
+  "$comment_ws_2": "Freqtrade's api_server ALREADY includes a websocket endpoint",
+  "$comment_ws_3": "(/api/v1/message/ws) whenever api_server.enabled is true above — it",
+  "$comment_ws_4": "is not a feature you turn on separately. What actually gates it is",
+  "$comment_ws_5": "ws_token: without one, ANYONE who can reach listen_port can connect",
+  "$comment_ws_6": "to it unauthenticated. Generate a real one before deploying — run",
+  "$comment_ws_7": "`python3 -c \"import secrets; print(secrets.token_urlsafe(25))\"`",
+  "$comment_ws_8": "and paste the result into ws_token above, replacing the placeholder.",
+
+  "$comment_webhook": "----- WEBHOOK — Freqtrade's OWN entry/exit/status notifications ---",
+  "$comment_webhook_2": "This covers generic lifecycle events with Freqtrade's fixed field",
+  "$comment_webhook_3": "set (see freqtrade.io/en/stable/webhook-config for the full field",
+  "$comment_webhook_4": "list per event). It does NOT and CANNOT carry v12_Strategy.py's own",
+  "$comment_webhook_5": "Phase 3.5 checkpoint fields (checkpoint_vol_ratio, final_checkpoint_sl,",
+  "$comment_webhook_6": "iv_move_at_checkpoint, etc.) — those are pushed separately by the",
+  "$comment_webhook_7": "strategy file itself via DASHBOARD_WEBHOOK_URL (see v12_Strategy.py's",
+  "$comment_webhook_8": "'Dashboard webhook' class constants) to the SAME url below, as a",
+  "$comment_webhook_9": "richer, strategy-specific payload alongside these generic ones.",
+  "$comment_webhook_10": "url below points at the dashboard-receiver service added in",
+  "$comment_webhook_11": "docker-compose.yml this session — change it if you host that",
+  "$comment_webhook_12": "receiver elsewhere. DISABLED (false) by default: like the options",
+  "$comment_webhook_13": "overlay and strategy-side webhook in v12_Strategy.py, this requires",
+  "$comment_webhook_14": "an explicit, deliberate opt-in rather than silently POSTing to a",
+  "$comment_webhook_15": "URL that was never a real, reachable service.",
+  "webhook": {
+    "enabled": false,
+    "url": "http://dashboard-receiver:5001/api/webhook",
+    "entry": {
+      "event": "entry",
+      "pair": "{pair}",
+      "trade_id": "{trade_id}",
+      "direction": "{direction}",
+      "limit": "{limit:.8f}",
+      "amount": "{amount:.8f}",
+      "open_rate": "{open_rate:.8f}",
+      "stake_amount": "{stake_amount:.8f}"
+    },
+    "entry_fill": {
+      "event": "entry_fill",
+      "pair": "{pair}",
+      "trade_id": "{trade_id}",
+      "direction": "{direction}",
+      "open_rate": "{open_rate:.8f}"
+    },
+    "entry_cancel": {
+      "event": "entry_cancel",
+      "pair": "{pair}",
+      "trade_id": "{trade_id}"
+    },
+    "exit": {
+      "event": "exit",
+      "pair": "{pair}",
+      "trade_id": "{trade_id}",
+      "limit": "{limit:.8f}",
+      "profit_amount": "{profit_amount:.8f}",
+      "profit_ratio": "{profit_ratio}",
+      "exit_reason": "{exit_reason}"
+    },
+    "exit_fill": {
+      "event": "exit_fill",
+      "pair": "{pair}",
+      "trade_id": "{trade_id}",
+      "close_rate": "{close_rate:.8f}",
+      "profit_amount": "{profit_amount:.8f}",
+      "profit_ratio": "{profit_ratio}"
+    },
+    "exit_cancel": {
+      "event": "exit_cancel",
+      "pair": "{pair}",
+      "trade_id": "{trade_id}"
+    },
+    "status": {
+      "event": "status",
+      "status": "{status}"
+    }
   },
 
   "$comment_db": "----- DATABASE — Render restart pe data na khoye, isliye Postgres --",
