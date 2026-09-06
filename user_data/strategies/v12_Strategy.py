@@ -242,6 +242,48 @@
 # test Trending-entry frequency and quality with and without it before
 # committing real capital to either configuration.
 # =============================================================================
+# 2026-09-06 AUDIT PASS (LIVE CRASH) — one additional defect found and fixed,
+# surfaced by an actual paper-trading crash traceback (bot exited a LINK/
+# USDT:USDT position via phase3_timebomb_exit, then died on the very next DB
+# commit):
+#
+#   H. custom_stoploss's returned stop_ratio — and the entry_adaptive_sl_pts/
+#      checkpoint_sl_pts values feeding it — were numpy.float64, not a
+#      native Python float. Root cause: candle["volatility_ratio"] is read
+#      from the analyzed dataframe in three places (confirm_trade_entry's
+#      Medium-tier-wait freeze, and custom_stoploss's own live-value and
+#      Phase 3.5 checkpoint branches), and a pandas Series scalar pulled
+#      from a float64-dtype column is numpy.float64, not float. Every value
+#      downstream in the chain (entry_adaptive_sl_pts -> active_sl_pts ->
+#      candidate_price -> stop_ratio via stoploss_from_absolute()) inherits
+#      that dtype, since numpy.float64 arithmetic contaminates the plain
+#      Python floats it's combined with, not the other way round.
+#
+#      Freqtrade persists this method's return value into
+#      trades.stop_loss_pct via SQLAlchemy/psycopg2. psycopg2 has no
+#      adapter registered for numpy.float64, so on the UPDATE it fell back
+#      to inlining repr(np.float64(-0.3238...)) as literal SQL text instead
+#      of a bound parameter. Postgres then read the dot in "np.float64(...)"
+#      as a schema-qualified identifier and raised psycopg2.errors.
+#      InvalidSchemaName: schema "np" does not exist — which SQLAlchemy
+#      escalated into a PendingRollbackError on the very next commit
+#      attempt (freqtradebot.py's cleanup() handler), taking the whole
+#      worker process down instead of just failing one update.
+#
+#      FIXED at the source: all three candle["volatility_ratio"] reads are
+#      now wrapped in float() at the point they leave the dataframe, so
+#      nothing downstream can inherit the numpy dtype regardless of which
+#      path runs (live value vs. frozen Medium-tier-wait value, entry vs.
+#      checkpoint). custom_stoploss's final return is also wrapped in
+#      float() as defense-in-depth, matching this file's existing pattern
+#      of guarding at both the source and the boundary (see the
+#      NaN-poisoning guard and leverage() floor guard above). That
+#      return-site cast alone would have stopped this specific crash, but
+#      not the same numpy.float64 also reaching _push_dashboard_webhook's
+#      JSON payload (json.dumps cannot serialize numpy.float64 either) if
+#      you ever flip DASHBOARD_WEBHOOK_ENABLED on — the source-level fix
+#      covers that path too.
+# =============================================================================
 
 import json
 import logging
@@ -1859,7 +1901,11 @@ class v12_Strategy(IStrategy):
                 # ("Phase 2.5 frozen rehti hai... wait ke dauraan"). We
                 # snapshot the volatility_ratio here so custom_stoploss can
                 # use the frozen value rather than recomputing it later.
-                "frozen_volatility_ratio": candle["volatility_ratio"],
+                # AUDIT FIX H (2026-09-06): cast to native float here, at
+                # the source — see the "2026-09-06 AUDIT PASS (LIVE CRASH)"
+                # header block above for the full numpy.float64 ->
+                # PostgreSQL crash trace this snapshot was feeding.
+                "frozen_volatility_ratio": float(candle["volatility_ratio"]),
             }
             logger.info(
                 "[Phase1.5-MediumWait] %s: entering Medium-tier wait "
@@ -2039,7 +2085,9 @@ class v12_Strategy(IStrategy):
                 # trade closes rather than leaving the dict entry forever.
                 wait_record["bound_trade_id"] = trade.id
             else:
-                vol_ratio = candle["volatility_ratio"]
+                # AUDIT FIX H (2026-09-06): cast to native float — see the
+                # "2026-09-06 AUDIT PASS (LIVE CRASH)" header block above.
+                vol_ratio = float(candle["volatility_ratio"])
 
             base_sl = (
                 self.BASE_SL_TRENDING_PTS
@@ -2181,7 +2229,9 @@ class v12_Strategy(IStrategy):
             and seconds_open >= self.CHECKPOINT_DELAY_SECONDS
         ):
             # --- Step 1: Volatility-Reassessment (widen OR tighten) -----
-            checkpoint_vol_ratio = candle["volatility_ratio"]
+            # AUDIT FIX H (2026-09-06): cast to native float — see the
+            # "2026-09-06 AUDIT PASS (LIVE CRASH)" header block above.
+            checkpoint_vol_ratio = float(candle["volatility_ratio"])
             checkpoint_sl_pts = self.BASE_SL_TRENDING_PTS * checkpoint_vol_ratio
             # already clamped via the dataframe's safe-ratio + .clip() in
             # populate_indicators (see AUDIT FIX A above)
@@ -2524,7 +2574,13 @@ class v12_Strategy(IStrategy):
         stop_ratio = stoploss_from_absolute(
             candidate_price, current_rate, is_short=trade.is_short, leverage=trade.leverage
         )
-        return stop_ratio
+        # AUDIT FIX H (2026-09-06): defense-in-depth cast to native float.
+        # The three candle["volatility_ratio"] reads upstream are now fixed
+        # at the source (see the "2026-09-06 AUDIT PASS (LIVE CRASH)" header
+        # block above), so stop_ratio should already be a plain float by the
+        # time it gets here — this cast is a cheap guarantee, not the fix
+        # itself, matching this file's existing guard-at-both-ends pattern.
+        return float(stop_ratio)
 
     # =====================================================================
     # PHASE 3: Capital Shield — Time-Bomb exit.
