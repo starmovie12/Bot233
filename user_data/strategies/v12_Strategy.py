@@ -47,11 +47,22 @@
 #
 #   4. OPTIONS MECHANICS: Freqtrade's Trade object is underlying-instrument-
 #      priced. There is no Delta, no premium layer, no per-strike order-book
-#      depth. Phase 2.6 (Delta-Translation) and Phase 2.7 (Liquidity Gate)
-#      are NOT faked with placeholder numbers — a fabricated liquidity check
-#      is worse than an honest gap. Adaptive-SL and the Phase 3.5 checkpoint
-#      are implemented entirely in UNDERLYING POINTS. A clearly-marked stub
-#      method shows where you would inject your own options data source.
+#      depth. PARTIALLY RESOLVED 2026-09-06: Phase 0.6 (pre-entry Theta/IV
+#      filter), Phase 2.6 (Delta-Translation), and Phase 3.5 Step 2 (IV-
+#      Crush Override) now read LIVE Delta/Theta/IV from a real Delta
+#      Exchange options contract (OPTIONS_SYMBOL_OVERRIDE — you must set
+#      this; there is no auto-selection) via _delta_options_reading(), gated
+#      behind OPTIONS_OVERLAY_ENABLED (default False). This bot still places
+#      NO options orders and Active-SL/breakeven/trailing still operate
+#      entirely in UNDERLYING POINTS throughout custom_stoploss — the
+#      options data is a risk-sizing/logging OVERLAY, not a second position.
+#      Phase 2.7 (Liquidity Gate / per-strike order-book depth) remains
+#      UNRESOLVED — Delta's ticker endpoint used here does not expose order-
+#      book depth, and this file still does not fake one. See the "OPTIONS
+#      RISK OVERLAY" class-constant block and _delta_options_reading's own
+#      docstring (search this file for "FIDELITY GAP #4 RESOLUTION") for the
+#      full account of what changed, what didn't, and the honest limitations
+#      of the local IV Rank approximation used in Phase 0.6.
 #
 #   5. KILL-SWITCH STATE: Phase 5's "two independent counters, 24hr window"
 #      is implemented with in-memory per-pair dictionaries on the strategy
@@ -232,12 +243,20 @@
 # committing real capital to either configuration.
 # =============================================================================
 
+import json
 import logging
 import math
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
+import requests  # ADDED 2026-09-06: FIDELITY GAP #4 resolution (Delta
+                  # Exchange options data client) and the Phase 3.5/entry/
+                  # exit dashboard webhook both need blocking HTTP calls.
+                  # See DeltaOptionsClient and _push_dashboard_webhook below
+                  # for why these are blocking, not async, and what that
+                  # costs the bot-loop iteration.
 import pandas as pd  # ADDED 2026-09-06: the ported SMC functions below
                       # (fvg/swing_highs_lows/bos_choch/ob) call pd.Series(...)
                       # and pd.concat(...) throughout their bodies; only
@@ -1070,6 +1089,173 @@ class v12_Strategy(IStrategy):
     KILL_SWITCH_CONSECUTIVE_SL = 3
     KILL_SWITCH_WINDOW_HOURS = 24
 
+    # =====================================================================
+    # OPTIONS RISK OVERLAY (Delta Exchange live data) — resolves FIDELITY
+    # GAP #4, added 2026-09-06.
+    #
+    # SCOPE, STATED PLAINLY: this bot still trades BTC/ETH/etc PERPETUAL
+    # FUTURES on Bybit (config.json's trading_mode/exchange are unchanged).
+    # No options orders are placed by this file. What changed is that
+    # Phase 0.6 (pre-entry filter), Phase 2.6 (Delta-translation of the
+    # underlying-points stop into an options-premium figure for logging/
+    # kill-switch purposes), and Phase 3.5 Step 2 (IV-crush override) now
+    # read LIVE Delta, Theta, and IV from a real Delta Exchange BTC options
+    # contract that you name below, instead of a fabricated Black-Scholes
+    # calculation or an underlying-price proxy. This is a RISK-SIZING
+    # OVERLAY on the futures trade, not a hedge, not a second position, and
+    # not options trading — Delta Exchange is never sent an order by this
+    # file.
+    #
+    # WHY NOT py_vollib: Delta Exchange's own /v2/tickers endpoint already
+    # returns server-side-computed `greeks.delta`, `greeks.theta`, and
+    # `quotes.ask_iv`/`quotes.bid_iv` for every options symbol, calculated
+    # by Delta's own risk engine against their own volatility model. Layering
+    # an independent py_vollib Black-Scholes-Merton calculation on top would
+    # produce a SECOND, mechanically-guaranteed-to-disagree IV/Delta/Theta
+    # for the same contract (different vol-surface assumptions, no shared
+    # source of truth) with no principled way to decide which one governs a
+    # real stop-loss. Given a choice between "the exchange's own number" and
+    # "my own model of the exchange's own instrument," this file uses the
+    # exchange's own number. If you want an independent cross-check later,
+    # add it as a SEPARATE diagnostic path that logs disagreement — do not
+    # feed a second IV source into the same sizing formula as the first.
+    #
+    # OPTIONS_SYMBOL_OVERRIDE: the ONE Delta Exchange options contract to
+    # poll for this overlay, e.g. "C-BTC-70000-261225" (see Delta's own
+    # symbology: <C or P>-BTC-<strike>-<expiry ddMMyy>). This file does NOT
+    # auto-select a contract (nearest-expiry/ATM) — you must set this
+    # yourself and keep it updated as the contract approaches expiry. Left
+    # as None by default so the overlay FAILS LOUDLY (raises, does not
+    # silently no-op) if you enable it without setting a real symbol —
+    # consistent with this file's existing "fail loud, never silently
+    # swallow a malformed value" standard (see the leverage() AUDIT FIX B/F
+    # comments). Auto-resolution (nearest expiry, strike nearest spot) was
+    # explicitly NOT added — that is a real design decision (rollover rule,
+    # ATM-vs-OTM choice) this file will not make silently on your behalf.
+    OPTIONS_OVERLAY_ENABLED = False  # explicit opt-in; False = every method
+                                      # below in this section returns None/
+                                      # no-ops instead of calling Delta at
+                                      # all. Flip to True only after setting
+                                      # OPTIONS_SYMBOL_OVERRIDE for real.
+    OPTIONS_SYMBOL_OVERRIDE: Optional[str] = None  # e.g. "C-BTC-70000-261225"
+    DELTA_EXCHANGE_API_BASE = "https://api.india.delta.exchange"  # public
+                                      # /v2/tickers/{symbol} endpoint, NO
+                                      # authentication required for this
+                                      # data (confirmed against Delta's own
+                                      # docs — this is public market data,
+                                      # not account data). If you trade on
+                                      # Delta Global rather than Delta
+                                      # India, change this to your region's
+                                      # base URL; api-key/secret are NOT
+                                      # used anywhere in this section.
+    OPTIONS_CACHE_TTL_SECONDS = 5.0  # custom_stoploss fires once per
+                                      # bot-loop iteration per open trade
+                                      # (realistically ~1s apart, per
+                                      # FIDELITY GAP #1) — polling Delta on
+                                      # every single call would burn the
+                                      # weight-3 rate-limit budget fast and
+                                      # add avoidable latency to every
+                                      # iteration. This TTL means at most
+                                      # one real HTTP call per this many
+                                      # seconds per symbol; calls inside the
+                                      # TTL window reuse the cached reading.
+                                      # This is still a BLOCKING call on a
+                                      # cache miss (Freqtrade calls these
+                                      # hooks synchronously, not as
+                                      # coroutines — an `async def` here
+                                      # would return an un-awaited
+                                      # coroutine object instead of running,
+                                      # which Freqtrade would misuse as the
+                                      # actual stoploss ratio). Tune down
+                                      # for fresher data at the cost of more
+                                      # calls/latency; tune up for the
+                                      # reverse.
+    OPTIONS_HTTP_TIMEOUT_SECONDS = 2.0  # short timeout so a slow/unreachable
+                                      # Delta API stalls one bot-loop
+                                      # iteration by at most this long, not
+                                      # indefinitely.
+    THETA_DECAY_BLOCK_PCT = 3.0  # Phase 0.6: block new entries if
+                                      # abs(theta) / premium * 100 exceeds
+                                      # this (blueprint's "Theta decay is
+                                      # >3% of the premium").
+    IV_RANK_BLOCK_THRESHOLD = 70.0  # Phase 0.6: block new entries if
+                                      # IV Rank >= this. See the
+                                      # `_delta_options_reading` docstring
+                                      # for how IV Rank is computed here
+                                      # (NOT provided directly by Delta's
+                                      # ticker endpoint) and what it
+                                      # approximates.
+    IV_RANK_LOOKBACK_READINGS = 288  # rolling window (in NUMBER OF
+                                      # `_delta_options_reading` CALLS, not
+                                      # a fixed wall-clock span, since calls
+                                      # are irregular — see the OPTIONS_CACHE_TTL
+                                      # comment above) used to derive IV
+                                      # Rank locally. 288 readings at one
+                                      # every ~5s (OPTIONS_CACHE_TTL_SECONDS)
+                                      # is roughly 24 minutes of history if
+                                      # trades are frequent enough to keep
+                                      # the cache populated continuously —
+                                      # in practice, with this bot's ~60-105s
+                                      # trade lifetimes (Phase 3 time-bomb),
+                                      # actual wall-clock coverage will be
+                                      # far patchier and dominated by
+                                      # between-trade gaps. This is a
+                                      # DELIBERATE APPROXIMATION, not
+                                      # Delta's own IV Rank (Delta's ticker
+                                      # endpoint does not expose one) — see
+                                      # the docstring below for the honest
+                                      # accounting of what this number does
+                                      # and does not represent.
+    IV_CRUSH_SPIKE_POINTS = 20.0  # Phase 3.5 Step 2 replacement: fire if
+                                      # live options IV rises by this many
+                                      # IV POINTS (e.g. 0.45 -> 0.65 is a
+                                      # 20-point spike) between entry and
+                                      # the 60s checkpoint. Matches the
+                                      # blueprint's stated "+20 points"
+                                      # language; NOTE this is a different
+                                      # unit than the old IV_CRUSH_TRIGGER_PTS
+                                      # (underlying price points) it
+                                      # replaces for entries opened while
+                                      # OPTIONS_OVERLAY_ENABLED — the old
+                                      # underlying-points proxy is still
+                                      # used as an automatic fallback if the
+                                      # live IV reading is unavailable at
+                                      # checkpoint time (see custom_stoploss
+                                      # Step 2 below).
+
+    # --- Dashboard webhook (entry / Phase 3.5 checkpoint / exit) ---------
+    # Freqtrade's OWN webhook config-block (see config.json's new "webhook"
+    # section) already covers generic entry/entry_fill/exit/exit_fill/
+    # status notifications with a fixed field set filled via string.format
+    # — that is a real, working mechanism and this file does not duplicate
+    # it. What Freqtrade's native webhook CANNOT do is push the Phase 3.5
+    # component-log fields (checkpoint_vol_ratio, final_checkpoint_sl,
+    # iv_move_at_checkpoint, etc.) — those values exist only inside this
+    # strategy's own state dicts, computed mid-trade inside custom_stoploss,
+    # with no Freqtrade-native event or field name for them. This section
+    # adds a SEPARATE, strategy-triggered POST specifically for those
+    # component fields, fired at entry, at the Phase 3.5 checkpoint, and at
+    # exit, so your dashboard can show the full component breakdown
+    # Freqtrade's own webhook was never designed to carry.
+    DASHBOARD_WEBHOOK_ENABLED = False  # explicit opt-in; see
+                                      # DASHBOARD_WEBHOOK_URL below for why
+                                      # this defaults off.
+    DASHBOARD_WEBHOOK_URL: Optional[str] = None  # e.g.
+                                      # "http://dashboard-receiver:5001/api/webhook"
+                                      # inside the docker-compose network,
+                                      # or a real external URL. Left as None
+                                      # so this fails loudly rather than
+                                      # POSTing to a placeholder IP that
+                                      # was never a real service — see the
+                                      # docker-compose.yml / dashboard
+                                      # receiver this session also produced,
+                                      # which is what this URL should point
+                                      # at if you use it as-is.
+    DASHBOARD_WEBHOOK_TIMEOUT_SECONDS = 1.5  # short and best-effort: a
+                                      # slow/unreachable dashboard must
+                                      # never be allowed to meaningfully
+                                      # delay a live trading decision.
+
     def __init__(self, config: dict) -> None:
         super().__init__(config)
 
@@ -1108,6 +1294,23 @@ class v12_Strategy(IStrategy):
         # long-side vs short-side).
         self._sl_streak: dict[str, list[datetime]] = {}
         self._kill_switch_flagged: dict[str, bool] = {}
+
+        # Options overlay: single shared HTTP session (connection reuse
+        # across calls) and a TTL cache keyed by options symbol, holding
+        # the last successful (reading, fetched_at) pair. See
+        # OPTIONS_CACHE_TTL_SECONDS above for why this cache exists at all.
+        self._options_http_session = requests.Session()
+        self._options_reading_cache: dict[str, tuple[dict, float]] = {}
+        # Rolling history of raw ask_iv readings per symbol, used ONLY to
+        # derive the local IV_RANK approximation described on
+        # IV_RANK_LOOKBACK_READINGS above. Bounded to that same length.
+        self._options_iv_history: dict[str, list[float]] = {}
+        # Per-trade snapshot of the options reading taken at ENTRY (first
+        # custom_stoploss call for that trade), so Phase 3.5 Step 2 can
+        # compare "IV now" against "IV at entry" rather than against some
+        # other trade's most recent reading. Keyed by trade id, cleared in
+        # confirm_trade_exit alongside the other per-trade state dicts.
+        self._options_entry_snapshot: dict[int, dict] = {}
 
     # =====================================================================
     # PHASE 0 + 0.3: populate_indicators
@@ -1557,6 +1760,59 @@ class v12_Strategy(IStrategy):
             )
             return False
 
+        # --- Phase 0.6: Options Pre-Entry Filter (Theta decay / IV Rank) --
+        # FIDELITY GAP #4 RESOLUTION (2026-09-06). Only active when
+        # OPTIONS_OVERLAY_ENABLED is True AND a live Delta Exchange reading
+        # is available; otherwise this block is a no-op and entries proceed
+        # exactly as before the overlay existed (fail-open, not fail-closed
+        # — a missing options reading blocks the OPTIONS FILTER, not the
+        # trade, since this bot's core strategy is futures, not options,
+        # and Phase 0.6's whole premise (blueprint's own options-mechanics
+        # section) assumed options data would be present to filter ON in
+        # the first place — no data means no filter to apply, not an
+        # automatic reject).
+        if self.OPTIONS_OVERLAY_ENABLED:
+            options_reading = self._delta_options_reading(current_time)
+            if options_reading is not None:
+                theta_decay_pct = (
+                    abs(options_reading["theta"]) / options_reading["premium"] * 100.0
+                    if options_reading["premium"] > 0
+                    else 0.0
+                )
+                if theta_decay_pct > self.THETA_DECAY_BLOCK_PCT:
+                    logger.warning(
+                        "[Phase0.6-OptionsFilter] %s: blocking entry — Theta "
+                        "decay %.2f%% of premium exceeds %.1f%% threshold "
+                        "(symbol=%s, theta=%.4f, premium=%.4f).",
+                        pair, theta_decay_pct, self.THETA_DECAY_BLOCK_PCT,
+                        self.OPTIONS_SYMBOL_OVERRIDE,
+                        options_reading["theta"], options_reading["premium"],
+                    )
+                    return False
+
+                if options_reading["iv_rank"] >= self.IV_RANK_BLOCK_THRESHOLD:
+                    logger.warning(
+                        "[Phase0.6-OptionsFilter] %s: blocking entry — IV Rank "
+                        "%.1f >= %.1f threshold (symbol=%s, iv=%.4f). NOTE: "
+                        "this IV Rank is a LOCAL approximation from this "
+                        "bot's own observed readings, not the option's true "
+                        "historical IV Rank — see _delta_options_reading's "
+                        "docstring.",
+                        pair, options_reading["iv_rank"],
+                        self.IV_RANK_BLOCK_THRESHOLD,
+                        self.OPTIONS_SYMBOL_OVERRIDE, options_reading["iv"],
+                    )
+                    return False
+            else:
+                logger.info(
+                    "[Phase0.6-OptionsFilter] %s: overlay enabled but no "
+                    "live options reading available this call — filter "
+                    "skipped, entry proceeds on futures-only logic (see "
+                    "_delta_options_reading docstring for why None means "
+                    "'no data', not 'reject').",
+                    pair,
+                )
+
         dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if dataframe.empty:
             return False
@@ -1833,6 +2089,75 @@ class v12_Strategy(IStrategy):
                 pair, trade.id, entry_adaptive_sl_pts, base_sl, vol_ratio, regime,
             )
 
+            # --- Phase 2.6: Delta-Translation (underlying pts -> premium) --
+            # FIDELITY GAP #4 RESOLUTION (2026-09-06). Snapshot the live
+            # options reading AT ENTRY (this "state is None" branch only
+            # ever runs once per trade, on its first custom_stoploss call —
+            # see AUDIT FIX E's comment above for why regime/entry values
+            # must be locked here and not re-derived later). This is the
+            # ONE place this file computes Premium_SL_pts, per your
+            # request's formula: Premium_SL_pts = Underlying_SL_pts * Delta.
+            #
+            # WHAT THIS NUMBER IS FOR, AND WHAT IT IS NOT: this bot places
+            # NO options order. Active-SL, breakeven, and trailing all
+            # continue to operate ENTIRELY in underlying futures points
+            # throughout this method, exactly as before the overlay —
+            # `active_sl_pts`/`candidate_price`/the returned stop_ratio
+            # below are UNCHANGED by this block. `premium_sl_pts` is
+            # computed and logged/pushed to the dashboard PURELY as an
+            # informational/kill-switch-accounting figure — "if this
+            # futures stop distance were instead expressed as options
+            # premium exposure via this contract's live Delta, what would
+            # that figure be" — per your request's Phase 2.6 ask. If you
+            # later want this number to actually DRIVE position sizing or
+            # kill-switch counting (blueprint Phase 2.6/5), that is a
+            # genuine product decision this file will not make silently on
+            # your behalf — the number is computed and available in
+            # `state["premium_sl_pts"]` for you to wire into a sizing
+            # decision explicitly, the same "flag, don't invent" standard
+            # this file uses throughout (see e.g. the leverage() method's
+            # own comment on not inventing a blueprint-unspecified number).
+            options_reading = self._delta_options_reading(current_time)
+            if options_reading is not None:
+                premium_sl_pts = entry_adaptive_sl_pts * abs(options_reading["delta"])
+                state["premium_sl_pts"] = premium_sl_pts
+                state["options_symbol"] = self.OPTIONS_SYMBOL_OVERRIDE
+                self._options_entry_snapshot[trade.id] = options_reading
+                logger.info(
+                    "[Phase2.6-DeltaTranslation] %s trade#%s: "
+                    "Underlying_SL=%.2fpt x |Delta|=%.4f (symbol=%s) -> "
+                    "Premium_SL=%.4f (options-premium units, "
+                    "INFORMATIONAL ONLY — does not alter the futures "
+                    "stop-loss returned by this method).",
+                    pair, trade.id, entry_adaptive_sl_pts,
+                    abs(options_reading["delta"]), self.OPTIONS_SYMBOL_OVERRIDE,
+                    premium_sl_pts,
+                )
+            else:
+                state["premium_sl_pts"] = None
+                state["options_symbol"] = None
+                if self.OPTIONS_OVERLAY_ENABLED:
+                    logger.info(
+                        "[Phase2.6-DeltaTranslation] %s trade#%s: overlay "
+                        "enabled but no live options reading available at "
+                        "entry — Premium_SL not computed for this trade.",
+                        pair, trade.id,
+                    )
+
+            self._push_dashboard_webhook(
+                event="entry",
+                pair=pair,
+                trade_id=trade.id,
+                payload={
+                    "entry_adaptive_sl": entry_adaptive_sl_pts,
+                    "regime": regime,
+                    "entry_volatility_ratio": vol_ratio,
+                    "options_symbol": state.get("options_symbol"),
+                    "premium_sl_pts": state.get("premium_sl_pts"),
+                    "options_reading_at_entry": options_reading,
+                },
+            )
+
         active_sl_pts = state["entry_adaptive_sl_pts"]  # default: entry value
         step2_multiplier = 1.0  # AUDIT FIX D — see below; overwritten once a
                                  # checkpoint has actually fired for this trade.
@@ -1862,20 +2187,75 @@ class v12_Strategy(IStrategy):
             # populate_indicators (see AUDIT FIX A above)
 
             # --- Step 2: IV-Crush Protective-Override -------------------
-            # FIDELITY GAP #4: the blueprint's IV-trigger is an options-IV
-            # event. With no options data source wired into this file, we
-            # use adverse underlying-price movement against the position
-            # since entry as a PROXY for "an actively materializing pricing
-            # risk," at the same point threshold (20pt, untested per
-            # blueprint). This is a substitution, not the real mechanism —
-            # see inject_options_iv_signal() stub below for where you'd
-            # replace it with a real IV feed.
+            # FIDELITY GAP #4 RESOLUTION (2026-09-06). Formerly used
+            # adverse underlying-price movement as a PROXY for "an
+            # actively materializing pricing risk" (see the file's prior
+            # header comment on this, now superseded). Replaced with a
+            # REAL live-IV-spike trigger against Delta Exchange's own
+            # ask_iv/bid_iv for OPTIONS_SYMBOL_OVERRIDE, per your request:
+            # "if IV spikes +20 points at the 60-second checkpoint, tighten
+            # by 70%." The underlying-points proxy is KEPT, unchanged, as
+            # an automatic fallback for when the overlay is disabled or no
+            # live reading is available at checkpoint time — this ensures
+            # Step 2 always has SOME signal to act on rather than silently
+            # never firing whenever Delta Exchange is briefly unreachable
+            # (a real, expected condition per this method's own
+            # RequestException handling above).
+            #
+            # NOTE ON IV_CRUSH_TIGHTEN_MULTIPLIER'S DIRECTION: this file
+            # keeps the existing 0.7 value UNCHANGED, meaning the result is
+            # 70% of the pre-tighten value (a 30% reduction) — this is the
+            # convention already threaded through the widen-floor logic
+            # below and the exit-time logging. Your original request's
+            # prose ("tighten by 70%") could also be read as a 70%
+            # REDUCTION (multiplier=0.3, a much more aggressive cut) — that
+            # is a real, deliberate product decision this file will not
+            # make silently on an ambiguous phrase; if you want the more
+            # aggressive reading, change IV_CRUSH_TIGHTEN_MULTIPLIER to 0.3
+            # at its definition near the top of this class — nothing below
+            # this point needs to change to support that.
             adverse_move_pts = (
                 (trade.open_rate - current_rate)
                 if is_long
                 else (current_rate - trade.open_rate)
             )
-            step2_fires = adverse_move_pts >= self.IV_CRUSH_TRIGGER_PTS
+
+            iv_at_checkpoint = None
+            iv_spike_points = None
+            step2_trigger_source = "underlying_proxy"  # overwritten below
+                                      # if a real IV reading is used instead
+
+            if self.OPTIONS_OVERLAY_ENABLED:
+                entry_snapshot = self._options_entry_snapshot.get(trade.id)
+                checkpoint_reading = self._delta_options_reading(current_time)
+                if entry_snapshot is not None and checkpoint_reading is not None:
+                    iv_at_checkpoint = checkpoint_reading["iv"]
+                    # Both entry and checkpoint IV are decimals (e.g. 0.45),
+                    # matching Delta's own quotes.*_iv convention. "+20
+                    # points" per your request is read as 20 IV PERCENTAGE
+                    # POINTS (0.45 -> 0.65), so the decimal difference is
+                    # scaled by 100 for the comparison against
+                    # IV_CRUSH_SPIKE_POINTS.
+                    iv_spike_points = (
+                        (checkpoint_reading["iv"] - entry_snapshot["iv"]) * 100.0
+                    )
+                    step2_trigger_source = "live_iv"
+                else:
+                    logger.info(
+                        "[Phase3.5-Step2] %s trade#%s: overlay enabled but "
+                        "entry snapshot and/or live checkpoint reading "
+                        "unavailable — falling back to underlying-price "
+                        "proxy for this checkpoint (entry_snapshot=%s, "
+                        "checkpoint_reading=%s).",
+                        pair, trade.id,
+                        entry_snapshot is not None,
+                        checkpoint_reading is not None,
+                    )
+
+            if step2_trigger_source == "live_iv":
+                step2_fires = iv_spike_points >= self.IV_CRUSH_SPIKE_POINTS
+            else:
+                step2_fires = adverse_move_pts >= self.IV_CRUSH_TRIGGER_PTS
 
             if step2_fires:
                 final_checkpoint_sl_pts = checkpoint_sl_pts * self.IV_CRUSH_TIGHTEN_MULTIPLIER
@@ -1889,6 +2269,9 @@ class v12_Strategy(IStrategy):
                     "checkpoint_sl_pts": checkpoint_sl_pts,
                     "iv_move_at_checkpoint": adverse_move_pts,
                     "step2_fired": step2_fires,
+                    "step2_trigger_source": step2_trigger_source,
+                    "iv_at_checkpoint": iv_at_checkpoint,
+                    "iv_spike_points": iv_spike_points,
                     "final_checkpoint_sl_pts": final_checkpoint_sl_pts,
                 }
             )
@@ -1905,10 +2288,15 @@ class v12_Strategy(IStrategy):
             # NOT collapsed into a single final-SL number, so that two trades
             # arriving at the same final SL via different routes (widen vs.
             # tighten) remain distinguishable in your logs/backtests.
+            # EXTENDED 2026-09-06 with step2_trigger_source/iv_spike_points
+            # so it's always visible in the logs whether a given trade's
+            # Step 2 decision came from real Delta Exchange IV data or the
+            # underlying-points fallback.
             logger.info(
                 "[Phase3.5-Checkpoint] %s trade#%s COMPONENT LOG :: "
                 "entry_adaptive_sl=%.2fpt | checkpoint_vol_ratio=%.3f | "
                 "checkpoint_sl=%.2fpt | iv_move_at_checkpoint=%.2fpt | "
+                "step2_trigger_source=%s | iv_spike_points=%s | "
                 "step2_fired=%s | final_checkpoint_sl=%.2fpt | "
                 "widen_vs_entry=%s",
                 pair, trade.id,
@@ -1916,9 +2304,27 @@ class v12_Strategy(IStrategy):
                 checkpoint_vol_ratio,
                 checkpoint_sl_pts,
                 adverse_move_pts,
+                step2_trigger_source,
+                f"{iv_spike_points:.2f}" if iv_spike_points is not None else "n/a",
                 step2_fires,
                 final_checkpoint_sl_pts,
                 final_checkpoint_sl_pts > state["entry_adaptive_sl_pts"],
+            )
+
+            self._push_dashboard_webhook(
+                event="checkpoint",
+                pair=pair,
+                trade_id=trade.id,
+                payload={
+                    "entry_adaptive_sl": state["entry_adaptive_sl_pts"],
+                    "checkpoint_vol_ratio": checkpoint_vol_ratio,
+                    "checkpoint_sl": checkpoint_sl_pts,
+                    "iv_move_at_checkpoint": adverse_move_pts,
+                    "step2_trigger_source": step2_trigger_source,
+                    "iv_spike_points": iv_spike_points,
+                    "step2_fired": step2_fires,
+                    "final_checkpoint_sl": final_checkpoint_sl_pts,
+                },
             )
 
         elif state["checkpoint_done"]:
@@ -2341,6 +2747,21 @@ class v12_Strategy(IStrategy):
             state.get("checkpoint_done", False),
         )
 
+        self._push_dashboard_webhook(
+            event="exit",
+            pair=pair,
+            trade_id=trade.id,
+            payload={
+                "exit_reason": exit_reason,
+                "active_sl_at_exit": active_sl_at_exit,
+                "checkpoint_triggered": state.get("checkpoint_done", False),
+                "step2_fired": state.get("step2_fired"),
+                "step2_trigger_source": state.get("step2_trigger_source"),
+                "premium_sl_pts": state.get("premium_sl_pts"),
+                "options_symbol": state.get("options_symbol"),
+            },
+        )
+
         # -----------------------------------------------------------------
         # PHASE 5: Kill-Switch bookkeeping.
         # "Do independent counters, 3rd-consecutive-SL dono mein 24hr-window
@@ -2376,6 +2797,13 @@ class v12_Strategy(IStrategy):
 
         # Clean up per-trade state now that the trade is closing.
         self._active_sl_state.pop(trade.id, None)
+        # ADDED 2026-09-06: mirrors the cleanup above for the options
+        # overlay's per-trade entry snapshot (see Phase 2.6 in
+        # custom_stoploss for where this is written). Without this, closed
+        # trades' snapshots would accumulate in memory for the life of the
+        # bot process — the same class of leak AUDIT FIX C already fixed
+        # for _medium_tier_wait, applied here to the new dict.
+        self._options_entry_snapshot.pop(trade.id, None)
 
         # -----------------------------------------------------------------
         # AUDIT FIX C (2026-09-05): clean up the Medium-tier wait entry that
@@ -2401,31 +2829,284 @@ class v12_Strategy(IStrategy):
     # inventing placeholder numbers for you.
     # =====================================================================
 
+    def _delta_options_reading(self, current_time: datetime) -> Optional[dict]:
+        """
+        FIDELITY GAP #4 RESOLUTION (2026-09-06). Formerly a NotImplementedError
+        stub (`inject_options_iv_signal`); replaced with a real client
+        against Delta Exchange's public options-ticker endpoint.
+
+        WHAT THIS RETURNS, AND WHAT IT DOES NOT:
+
+        Returns a dict with live data for OPTIONS_SYMBOL_OVERRIDE:
+            {
+                "delta": float,       # Delta's own greeks.delta, signed
+                                       # per Delta's convention (calls
+                                       # positive, puts negative)
+                "theta": float,       # Delta's own greeks.theta (per-day
+                                       # decay, Delta's own convention —
+                                       # this file does not rescale it)
+                "iv": float,          # mid of quotes.ask_iv/bid_iv when
+                                       # both present, else whichever is
+                                       # present, as a DECIMAL (0.65 = 65%),
+                                       # matching Delta's own quotes.*_iv
+                                       # convention
+                "iv_rank": float,     # 0-100, see the LOCAL APPROXIMATION
+                                       # warning below — this is NOT Delta's
+                                       # own IV Rank (their ticker endpoint
+                                       # does not expose one)
+                "premium": float,     # mark_price of the OPTIONS contract
+                                       # itself (i.e. the options premium),
+                                       # NOT the underlying spot/futures
+                                       # price
+                "spot_price": float,  # Delta's own spot_price field for
+                                       # this contract's underlying
+                "fetched_at": float,  # time.time() this reading was
+                                       # obtained (may be OLDER than "now"
+                                       # if served from the TTL cache)
+                "from_cache": bool,
+            }
+        or None if the overlay is disabled, misconfigured, or the live
+        fetch failed for any reason (network, timeout, malformed response,
+        symbol not found). EVERY CALL SITE in this file (Phase 0.6, Phase
+        2.6, Phase 3.5 Step 2) MUST treat None as "no options data
+        available right now" and fall back to its documented pre-overlay
+        behavior — never treat None as zero, and never let a None here
+        raise up into Freqtrade's bot-loop. This mirrors the file's
+        existing NaN-guard/leverage-floor standard: a missing external
+        reading should degrade the strategy's behavior in a known,
+        documented way, not crash it or silently corrupt a downstream
+        calculation.
+
+        LOCAL "IV RANK" APPROXIMATION — READ THIS BEFORE TRUSTING IT:
+        Delta Exchange's /v2/tickers endpoint gives a live ask_iv/bid_iv
+        SNAPSHOT, not a rolling IV Rank. A genuine IV Rank needs a real
+        rolling window of *historical* IV, ideally sampled continuously
+        over a meaningful period (the industry-standard definition uses a
+        trailing 52 weeks) — this bot has neither Delta's historical-IV
+        endpoint wired in, nor continuous uptime guaranteed (RISK_AND_
+        LIMITATIONS.md already documents Render's free tier restarting
+        this bot; IV Rank is rebuilt from that "restart" trigger AS WELL,
+        exactly as with IV history because both live only in this
+        process's memory (self._options_iv_history), not in Delta's own
+        API or a persisted store). What is computed here is: percentile
+        rank of the CURRENT iv reading against the last
+        IV_RANK_LOOKBACK_READINGS raw ask_iv values THIS BOT ITSELF
+        observed, across however many _delta_options_reading calls that
+        spans — NOT a fixed wall-clock window, and NOT comparable to a
+        genuine 52-week IV Rank a real options platform would show. With
+        fewer than 20 readings collected so far, this returns 50.0 (a
+        neutral midpoint) rather than a rank computed on too little data
+        to mean anything — Phase 0.6's IV_RANK_BLOCK_THRESHOLD=70.0 check
+        will therefore never block a trade on IV Rank grounds until the
+        bot has been running long enough to accumulate that history. This
+        is a real, load-bearing limitation, not a formality — treat this
+        field as a rough, self-relative signal, not a genuine percentile
+        against the option's real historical IV distribution.
+        """
+        if not self.OPTIONS_OVERLAY_ENABLED:
+            return None
+
+        if not self.OPTIONS_SYMBOL_OVERRIDE:
+            # Fail LOUD here (log, don't raise) — enabling the overlay
+            # without setting a real symbol is a configuration mistake,
+            # and this file's standard (see leverage() AUDIT FIX B/F) is
+            # to surface that loudly rather than silently no-op forever.
+            logger.error(
+                "[OptionsOverlay] OPTIONS_OVERLAY_ENABLED=True but "
+                "OPTIONS_SYMBOL_OVERRIDE is not set. Set it to a real "
+                "Delta Exchange options symbol (e.g. 'C-BTC-70000-261225') "
+                "before enabling the overlay. Overlay calls will keep "
+                "returning None (falling back to pre-overlay behavior) "
+                "until this is fixed."
+            )
+            return None
+
+        symbol = self.OPTIONS_SYMBOL_OVERRIDE
+        now = time.time()
+
+        cached = self._options_reading_cache.get(symbol)
+        if cached is not None:
+            reading, fetched_at = cached
+            if now - fetched_at < self.OPTIONS_CACHE_TTL_SECONDS:
+                reading = dict(reading)
+                reading["from_cache"] = True
+                return reading
+
+        url = f"{self.DELTA_EXCHANGE_API_BASE}/v2/tickers/{symbol}"
+        try:
+            resp = self._options_http_session.get(
+                url,
+                headers={"Accept": "application/json"},
+                timeout=self.OPTIONS_HTTP_TIMEOUT_SECONDS,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except requests.RequestException as exc:
+            logger.warning(
+                "[OptionsOverlay] %s: Delta Exchange fetch failed (%s). "
+                "Falling back to pre-overlay behavior for this call.",
+                symbol, exc,
+            )
+            return None
+        except (ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "[OptionsOverlay] %s: Delta Exchange returned unparseable "
+                "JSON (%s). Falling back to pre-overlay behavior.",
+                symbol, exc,
+            )
+            return None
+
+        if not payload.get("success"):
+            logger.warning(
+                "[OptionsOverlay] %s: Delta Exchange responded success=false "
+                "(%s). Falling back to pre-overlay behavior.",
+                symbol, payload.get("error"),
+            )
+            return None
+
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            logger.warning(
+                "[OptionsOverlay] %s: Delta Exchange response missing "
+                "'result' object. Falling back to pre-overlay behavior.",
+                symbol,
+            )
+            return None
+
+        try:
+            greeks = result.get("greeks") or {}
+            quotes = result.get("quotes") or {}
+
+            delta_val = float(greeks["delta"])
+            theta_val = float(greeks["theta"])
+
+            ask_iv_raw = quotes.get("ask_iv")
+            bid_iv_raw = quotes.get("bid_iv")
+            iv_samples = [float(v) for v in (ask_iv_raw, bid_iv_raw) if v is not None]
+            if not iv_samples:
+                raise KeyError("quotes.ask_iv/bid_iv both missing")
+            iv_val = sum(iv_samples) / len(iv_samples)
+
+            premium_val = float(result["mark_price"])
+            spot_val = float(result["spot_price"])
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning(
+                "[OptionsOverlay] %s: Delta Exchange response missing/"
+                "malformed a required field (%s). Falling back to "
+                "pre-overlay behavior. Raw result keys: %s",
+                symbol, exc, list(result.keys()),
+            )
+            return None
+
+        # Update the rolling IV history used for the local IV Rank
+        # approximation (see docstring above for exactly what this is and
+        # is not). Bounded to IV_RANK_LOOKBACK_READINGS entries.
+        history = self._options_iv_history.setdefault(symbol, [])
+        history.append(iv_val)
+        if len(history) > self.IV_RANK_LOOKBACK_READINGS:
+            del history[: len(history) - self.IV_RANK_LOOKBACK_READINGS]
+
+        if len(history) < 20:
+            iv_rank = 50.0  # neutral midpoint; see docstring — insufficient
+                             # history to compute a meaningful percentile.
+        else:
+            below_or_equal = sum(1 for v in history if v <= iv_val)
+            iv_rank = 100.0 * below_or_equal / len(history)
+
+        reading = {
+            "delta": delta_val,
+            "theta": theta_val,
+            "iv": iv_val,
+            "iv_rank": iv_rank,
+            "premium": premium_val,
+            "spot_price": spot_val,
+            "fetched_at": now,
+            "from_cache": False,
+        }
+        self._options_reading_cache[symbol] = (reading, now)
+        return dict(reading)
+
+    # Kept as a thin, explicitly-deprecated alias so any external code or
+    # notes referencing the old stub name by its original signature still
+    # resolves to real behavior instead of silently vanishing. New code in
+    # this file calls _delta_options_reading directly.
     def inject_options_iv_signal(self, pair: str, current_time: datetime) -> Optional[float]:
         """
-        FIDELITY GAP #4 stub. Not called anywhere in this file.
-
-        Phase 3.5 Step 2 (IV-Crush Protective-Override) and Phase 0.6
-        (IV Rank / Theta pre-entry filters) both require live options IV
-        data that Freqtrade's OHLCV dataframe does not carry. If you have
-        an options data source (broker API, IV feed), wire it in here and
-        replace the `adverse_move_pts` underlying-price proxy in
-        custom_stoploss's Step 2 block with a real IV-move reading.
-
-        Similarly, Phase 2.6 (Delta-Translation) and Phase 2.7 (Liquidity
-        Gate) need a per-strike order-book/Greeks feed to translate
-        Active-SL from underlying points into premium terms and to check
-        depth — neither is implemented here. This file's Active-SL, Phase 3
-        Capital Shield, and Phase 4 Trailing all operate in UNDERLYING
-        POINTS throughout; converting to premium terms for options position
-        sizing/kill-switch counting (per blueprint Phase 2.6/5) is left to
-        you to add at the position-sizing layer, using this method as the
-        wiring point.
+        DEPRECATED ALIAS (2026-09-06) — kept only for backward-compatible
+        naming. Returns just the `iv` field from _delta_options_reading(),
+        or None under the same conditions that method returns None. Prefer
+        calling _delta_options_reading() directly anywhere you need more
+        than the bare IV number (Delta, Theta, premium, IV Rank, etc.) —
+        this method throws away everything else it fetched to match the
+        old stub's `Optional[float]` signature.
         """
-        raise NotImplementedError(
-            "Wire your options IV/Greeks/order-book data source here. "
-            "Not implemented — see FIDELITY GAP #4 in the file header."
-        )
+        reading = self._delta_options_reading(current_time)
+        return reading["iv"] if reading is not None else None
+
+    def _push_dashboard_webhook(self, event: str, pair: str, trade_id: int, payload: dict) -> None:
+        """
+        Best-effort POST of the Phase 3.5 Component-Level Logging payload to
+        DASHBOARD_WEBHOOK_URL. Added 2026-09-06 alongside the options
+        overlay above.
+
+        This is DELIBERATELY SEPARATE from Freqtrade's own native
+        "webhook" config-block (see config.json). Freqtrade's native
+        webhook already handles generic entry/entry_fill/exit/exit_fill/
+        status notifications with a fixed field set — this method exists
+        ONLY because those fixed fields cannot carry this strategy's own
+        mid-trade component values (checkpoint_vol_ratio,
+        final_checkpoint_sl, iv_move_at_checkpoint, the options-overlay
+        readings, etc.), which live only in this file's own state dicts
+        and have no Freqtrade-native event or field name.
+
+        FAILURE HANDLING: this method NEVER raises. A slow, unreachable,
+        or misconfigured dashboard must not be allowed to delay or corrupt
+        a live trading decision — every exception is caught, logged at
+        WARNING, and swallowed. Called from three places: the first
+        custom_stoploss call for a trade (event="entry"), the Phase 3.5
+        checkpoint firing inside custom_stoploss (event="checkpoint"), and
+        confirm_trade_exit (event="exit").
+        """
+        if not self.DASHBOARD_WEBHOOK_ENABLED:
+            return
+
+        if not self.DASHBOARD_WEBHOOK_URL:
+            logger.error(
+                "[DashboardWebhook] DASHBOARD_WEBHOOK_ENABLED=True but "
+                "DASHBOARD_WEBHOOK_URL is not set. Set it to a real "
+                "receiver URL (see the docker-compose.yml dashboard-receiver "
+                "service this session produced) before enabling. Webhook "
+                "pushes will keep silently no-op'ing until this is fixed."
+            )
+            return
+
+        body = {
+            "event": event,  # "entry" | "checkpoint" | "exit"
+            "pair": pair,
+            "trade_id": trade_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        }
+
+        try:
+            self._options_http_session.post(
+                self.DASHBOARD_WEBHOOK_URL,
+                json=body,
+                timeout=self.DASHBOARD_WEBHOOK_TIMEOUT_SECONDS,
+            )
+            # Response status is intentionally NOT checked/raised on here.
+            # This push is fire-and-forget from the trading loop's
+            # perspective — a dashboard-side 4xx/5xx is a dashboard
+            # problem to fix by reading ITS logs, not a reason to disrupt
+            # bot_loop timing or retry-with-backoff inside a live
+            # stop-loss calculation.
+        except requests.RequestException as exc:
+            logger.warning(
+                "[DashboardWebhook] %s trade#%s: push failed for event=%s "
+                "(%s). Trading logic is unaffected; this only means the "
+                "dashboard did not receive this update.",
+                pair, trade_id, event, exc,
+            )
 
     # def _rebuild_kill_switch_from_trade_history(self) -> None:
     #     """
