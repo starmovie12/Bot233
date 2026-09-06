@@ -15,6 +15,12 @@
 #   API_USERNAME    — FreqUI / REST API login username
 #   API_PASSWORD    — FreqUI / REST API login password
 #   JWT_SECRET      — any long random string
+#   WS_TOKEN        — ADDED 2026-09-06: token for api_server's websocket
+#                     endpoint (config.json's api_server.ws_token). Without
+#                     this substitution, the placeholder string in
+#                     config.json would be used as the actual token,
+#                     defeating the point of having one — generate via
+#                     `python3 -c "import secrets; print(secrets.token_urlsafe(25))"`
 #
 # If DB_URL is unset, this falls back to the SQLite path already in
 # config.json — that's fine for a quick test, but see RISK_AND_LIMITATIONS.md
