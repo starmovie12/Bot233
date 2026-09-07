@@ -288,7 +288,10 @@
 import json
 import logging
 import math
+import os
+import threading
 import time
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -1320,6 +1323,26 @@ class v12_Strategy(IStrategy):
         # (this repo's actual config) the old behavior was one stale dict
         # key, effectively harmless; this fix matters the moment
         # pair_whitelist ever grows past one pair.
+        #
+        # RESTART-SAFE STATE FIX (2026-09-07): unlike _active_sl_state
+        # below (keyed by trade.id, so it can ride on Freqtrade's own
+        # Trade.set_custom_data/get_custom_data DB persistence),
+        # _medium_tier_wait is necessarily keyed by PAIR — a Medium-tier
+        # wait exists specifically in the window BEFORE a trade has
+        # opened, so there is no Trade object yet to attach custom_data
+        # to. Persisted instead to a small JSON file under Freqtrade's own
+        # user_data_dir (the same persistent volume the SQLite/trade DB
+        # already lives on — NOT /tmp, which Render can wipe on restart),
+        # restored once at startup by bot_loop_start(), and re-written to
+        # disk every time this dict is mutated (see
+        # _persist_medium_tier_wait, called from confirm_trade_entry and
+        # confirm_trade_exit's cleanup, and _restore_medium_tier_wait,
+        # called once from bot_loop_start). Worst case if a restart lands
+        # exactly inside the few-second Medium-tier wait window before
+        # this fix could ever run once (extremely narrow): a lost wait is
+        # a missed entry, not a stuck position — asymmetric with the
+        # stuck-open-trade risk this file's other restart-safety fixes
+        # target, but still worth closing now that it's a five-minute fix.
         self._medium_tier_wait: dict[str, dict] = {}
 
         # Phase 2.5 / 3.5 Active-SL resolution state, keyed by trade id.
@@ -1336,6 +1359,22 @@ class v12_Strategy(IStrategy):
         # long-side vs short-side).
         self._sl_streak: dict[str, list[datetime]] = {}
         self._kill_switch_flagged: dict[str, bool] = {}
+
+        # RESTART-SAFE STATE FIX (2026-09-07): resolve the on-disk path
+        # for _medium_tier_wait persistence (see the long comment on that
+        # attribute's own definition above for why this needs a file
+        # rather than Trade.set_custom_data). Uses Freqtrade's own
+        # standard "user_data_dir" config key (the same directory
+        # --userdir points at / the default "user_data" folder), which is
+        # the persistent volume this bot's SQLite/Postgres trade DB
+        # already relies on — falls back to a local "user_data" relative
+        # path only if that config key is somehow missing (e.g. certain
+        # non-standard invocations), so this never raises during __init__.
+        try:
+            user_data_dir = Path(self.config["user_data_dir"])
+        except Exception:
+            user_data_dir = Path("user_data")
+        self._medium_tier_wait_file = user_data_dir / "v12_medium_tier_wait_state.json"
 
         # Options overlay: single shared HTTP session (connection reuse
         # across calls) and a TTL cache keyed by options symbol, holding
@@ -1918,7 +1957,13 @@ class v12_Strategy(IStrategy):
             # fresh wait is permitted to start (the safeguard scopes "once"
             # to a single trade-lifecycle/signal-occurrence, not forever).
             self._medium_tier_wait[pair] = {
-                "start_time": current_time,
+                "start_time": current_time.isoformat(),  # RESTART-SAFE
+                    # STATE FIX: stored as ISO string (not a datetime
+                    # object) so this dict is JSON-serializable for the
+                    # file-backed persistence below. Not read back
+                    # anywhere in this file (cycles_seen is what actually
+                    # drives the wait's timeout), so this format change
+                    # has no effect on existing logic.
                 "cycles_seen": 0,
                 "consumed": False,
                 # Freeze Phase 2.5 Adaptive-SL and Intended-Quantity at
@@ -1932,6 +1977,7 @@ class v12_Strategy(IStrategy):
                 # PostgreSQL crash trace this snapshot was feeding.
                 "frozen_volatility_ratio": float(candle["volatility_ratio"]),
             }
+            self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
             logger.info(
                 "[Phase1.5-MediumWait] %s: entering Medium-tier wait "
                 "(up to %s cycles). Adaptive-SL frozen at volatility_ratio=%.3f.",
@@ -1942,6 +1988,7 @@ class v12_Strategy(IStrategy):
             return False  # Deny this iteration; re-checked next iteration.
 
         wait_state["cycles_seen"] += 1
+        self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
 
         if wait_state["cycles_seen"] < self.MEDIUM_TIER_WAIT_CYCLES:
             # Still waiting. FIDELITY GAP #1 reminder: "cycles" here are bot
@@ -1968,6 +2015,7 @@ class v12_Strategy(IStrategy):
                 candle["direction_confident"],
             )
             wait_state["consumed"] = True
+            self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
             return False
 
         # Step B: fresh ADX-margin / DI-gap-margin. Breakout magnitude and
@@ -2004,6 +2052,7 @@ class v12_Strategy(IStrategy):
         wait_state["consumed"] = True  # Anti-infinite-loop: this wait is done,
                                         # win or lose, no re-wait regardless of
                                         # future reclassifications.
+        self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
 
         if fresh_tier in ("high", "medium"):
             logger.info(
@@ -2131,6 +2180,7 @@ class v12_Strategy(IStrategy):
                 # produced, so confirm_trade_exit can clear it when THIS
                 # trade closes rather than leaving the dict entry forever.
                 wait_record["bound_trade_id"] = trade.id
+                self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
             else:
                 # AUDIT FIX H (2026-09-06): cast to native float — see the
                 # "2026-09-06 AUDIT PASS (LIVE CRASH)" header block above.
@@ -2390,7 +2440,15 @@ class v12_Strategy(IStrategy):
             if step2_trigger_source == "live_iv":
                 step2_fires = iv_spike_points >= self.IV_CRUSH_SPIKE_POINTS
             else:
-                step2_fires = adverse_move_pts >= self.IV_CRUSH_TRIGGER_PTS
+                # CROSS-PAIR SCALE FIX (2026-09-07): adverse_move_pts is a
+                # raw price-difference (trade.open_rate - current_rate),
+                # same issue as SL/breakeven/trailing/breakout above — a
+                # fixed 20.0-point IV_CRUSH_TRIGGER_PTS threshold is
+                # trivially crossed on some pairs and unreachable on
+                # others. Normalized by state["atr_scale"] (frozen at this
+                # trade's entry), matching the same convention used
+                # throughout custom_stoploss.
+                step2_fires = adverse_move_pts >= (self.IV_CRUSH_TRIGGER_PTS * state["atr_scale"])
 
             if step2_fires:
                 final_checkpoint_sl_pts = checkpoint_sl_pts * self.IV_CRUSH_TIGHTEN_MULTIPLIER
@@ -2980,6 +3038,7 @@ class v12_Strategy(IStrategy):
         wait_record = self._medium_tier_wait.get(pair)
         if wait_record is not None and wait_record.get("bound_trade_id") == trade.id:
             del self._medium_tier_wait[pair]
+            self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
 
         return True
 
@@ -3227,6 +3286,16 @@ class v12_Strategy(IStrategy):
         custom_stoploss call for a trade (event="entry"), the Phase 3.5
         checkpoint firing inside custom_stoploss (event="checkpoint"), and
         confirm_trade_exit (event="exit").
+
+        ASYNC FIX (2026-09-07, Tier-3 #10): this used to call
+        self._options_http_session.post(...) SYNCHRONOUSLY, right on the
+        trading loop's own thread, at exactly the moments (entry,
+        checkpoint, exit) where decision latency matters most — a slow
+        receiver could block a live stop-loss/exit calculation for up to
+        DASHBOARD_WEBHOOK_TIMEOUT_SECONDS. Still disabled by default and
+        still never raises, but the actual POST now runs on a short-lived
+        daemon thread so a slow/unreachable dashboard can only ever delay
+        the DASHBOARD PUSH, never the trading decision that triggered it.
         """
         if not self.DASHBOARD_WEBHOOK_ENABLED:
             return
@@ -3249,24 +3318,106 @@ class v12_Strategy(IStrategy):
             **payload,
         }
 
+        def _do_post():
+            try:
+                self._options_http_session.post(
+                    self.DASHBOARD_WEBHOOK_URL,
+                    json=body,
+                    timeout=self.DASHBOARD_WEBHOOK_TIMEOUT_SECONDS,
+                )
+                # Response status is intentionally NOT checked/raised on
+                # here. This push is fire-and-forget from the trading
+                # loop's perspective — a dashboard-side 4xx/5xx is a
+                # dashboard problem to fix by reading ITS logs, not a
+                # reason to disrupt bot_loop timing or retry-with-backoff.
+            except requests.RequestException as exc:
+                logger.warning(
+                    "[DashboardWebhook] %s trade#%s: push failed for event=%s "
+                    "(%s). Trading logic is unaffected; this only means the "
+                    "dashboard did not receive this update.",
+                    pair, trade_id, event, exc,
+                )
+            except Exception:
+                logger.exception(
+                    "[DashboardWebhook] %s trade#%s: unexpected error in "
+                    "background push thread for event=%s. Trading logic is "
+                    "unaffected.",
+                    pair, trade_id, event,
+                )
+
         try:
-            self._options_http_session.post(
-                self.DASHBOARD_WEBHOOK_URL,
-                json=body,
-                timeout=self.DASHBOARD_WEBHOOK_TIMEOUT_SECONDS,
+            threading.Thread(target=_do_post, daemon=True).start()
+        except Exception:
+            logger.exception(
+                "[DashboardWebhook] %s trade#%s: failed to start background "
+                "push thread for event=%s; push skipped this time. Trading "
+                "logic is unaffected.",
+                pair, trade_id, event,
             )
-            # Response status is intentionally NOT checked/raised on here.
-            # This push is fire-and-forget from the trading loop's
-            # perspective — a dashboard-side 4xx/5xx is a dashboard
-            # problem to fix by reading ITS logs, not a reason to disrupt
-            # bot_loop timing or retry-with-backoff inside a live
-            # stop-loss calculation.
-        except requests.RequestException as exc:
-            logger.warning(
-                "[DashboardWebhook] %s trade#%s: push failed for event=%s "
-                "(%s). Trading logic is unaffected; this only means the "
-                "dashboard did not receive this update.",
-                pair, trade_id, event, exc,
+
+    def _persist_medium_tier_wait(self) -> None:
+        """
+        RESTART-SAFE STATE FIX (2026-09-07). Writes the full
+        self._medium_tier_wait dict to a JSON file under Freqtrade's own
+        user_data_dir (see the path resolved in __init__), so a Medium-
+        tier wait in progress survives a restart instead of silently
+        vanishing along with every other in-memory dict this file used to
+        rely on. Called from every mutation site (wait created,
+        cycles_seen incremented, consumed, bound to a trade, deleted on
+        trade close) — see call sites above. Cheap: this dict is at most
+        one entry per whitelisted pair, each a handful of small fields.
+
+        Uses an atomic write (write to a temp file, then os.replace) so a
+        crash mid-write can never leave a half-written, corrupt state
+        file behind for the next startup to choke on.
+        """
+        try:
+            self._medium_tier_wait_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self._medium_tier_wait_file.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(self._medium_tier_wait, f)
+            os.replace(tmp_path, self._medium_tier_wait_file)
+        except Exception:
+            logger.exception(
+                "[Phase1.5-Persist] Failed to persist _medium_tier_wait to "
+                "%s. Trading continues normally off the in-memory copy; "
+                "only restart-recovery of any in-progress Medium-tier "
+                "wait is affected.",
+                self._medium_tier_wait_file,
+            )
+
+    def _restore_medium_tier_wait(self) -> None:
+        """
+        Counterpart to _persist_medium_tier_wait above. Called once from
+        bot_loop_start() on the first loop iteration after a (re)start,
+        loading any Medium-tier wait(s) that were in progress when the
+        process last stopped, so they resume instead of being silently
+        forgotten. If the file doesn't exist (fresh deploy, or no wait was
+        ever in progress) or is unreadable/corrupt, this leaves
+        self._medium_tier_wait as the empty dict __init__ already set it
+        to — same behavior as before this fix, never worse.
+        """
+        if not self._medium_tier_wait_file.exists():
+            return
+        try:
+            with open(self._medium_tier_wait_file) as f:
+                restored = json.load(f)
+            if isinstance(restored, dict):
+                self._medium_tier_wait = restored
+                if restored:
+                    logger.info(
+                        "[Phase1.5-RestartRecovery] Restored %d in-progress "
+                        "Medium-tier wait(s) from %s after a restart: %s.",
+                        len(restored), self._medium_tier_wait_file,
+                        list(restored.keys()),
+                    )
+        except Exception:
+            logger.exception(
+                "[Phase1.5-Persist] Failed to restore _medium_tier_wait "
+                "from %s. Continuing with empty in-memory state (same as "
+                "before this fix) rather than crashing the bot on a "
+                "corrupt/unreadable state file.",
+                self._medium_tier_wait_file,
             )
 
     _ACTIVE_SL_CUSTOM_DATA_KEY = "v12_active_sl_state"
@@ -3376,15 +3527,22 @@ class v12_Strategy(IStrategy):
 
     def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
         """
-        WATCHDOG (Tier-1 fix, 2026-09-07). Two jobs, both previously
+        WATCHDOG (Tier-1 fix, 2026-09-07). Three jobs, all previously
         missing entirely from this file:
 
-        1. One-time on first loop iteration: rebuild kill-switch state
+        1. Every loop iteration: touch a heartbeat file so start.sh's
+           watchdog loop (see that file) can detect a fully-hung process
+           and kill it, letting Render's normal restart-on-exit behavior
+           actually fire. Render only restarts on process EXIT, not on a
+           still-running-but-frozen process, and there is no active
+           health check for this deployment type — this closes that gap.
+
+        2. One-time on first loop iteration: rebuild kill-switch state
            from trade history (see _rebuild_kill_switch_from_trade_history
            above) so a restart doesn't silently zero out the 24h
            consecutive-SL counter.
 
-        2. Every loop iteration: scan all open trades. custom_exit's
+        3. Every loop iteration: scan all open trades. custom_exit's
            timebomb logic only ever runs when Freqtrade calls
            should_exit()/custom_exit() for a trade on its normal
            per-candle path. If a pair's candle fetch hangs or stalls
@@ -3396,9 +3554,21 @@ class v12_Strategy(IStrategy):
            2x TRENDING_TIMEBOMB_SECONDS as a hard backstop, and logs
            loudly so it's visible this happened.
         """
+        try:
+            with open("/tmp/freqtrade_heartbeat", "w") as f:
+                f.write(current_time.isoformat())
+        except Exception:
+            logger.exception(
+                "[Watchdog] Failed to write heartbeat file. start.sh's "
+                "external watchdog may eventually treat this as a hang "
+                "and restart the process even though the bot loop is "
+                "actually still running — non-fatal, continuing."
+            )
+
         if not self._watchdog_kill_switch_rebuilt:
             self._watchdog_kill_switch_rebuilt = True
             self._rebuild_kill_switch_from_trade_history()
+            self._restore_medium_tier_wait()  # RESTART-SAFE STATE FIX
 
         watchdog_limit_seconds = 2 * self.TRENDING_TIMEBOMB_SECONDS
 
