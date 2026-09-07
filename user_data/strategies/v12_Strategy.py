@@ -1460,12 +1460,29 @@ class v12_Strategy(IStrategy):
         # Breakout magnitude: how far the close cleared the prior 20-bar high/low,
         # used both for entry trigger and as the (frozen, per blueprint Step B)
         # breakout-magnitude confirmation-tier input.
+        #
+        # CROSS-PAIR SCALE FIX (2026-09-07): raw price-difference here (e.g.
+        # a $0.50 clearance) is meaningless compared across a pair_whitelist
+        # spanning BTC (~$100,000+) to PEPE (~$0.00001) — HIGH_TIER_
+        # BREAKOUT_PTS=0.5 is trivially cleared on some pairs and
+        # structurally unreachable on others. Normalized here by dividing
+        # by this candle's own ATR(14), so breakout_magnitude_* is now
+        # expressed in "ATR units" (how many average-true-ranges the close
+        # cleared the prior high/low by) — a scale-free quantity comparable
+        # across every pair. HIGH_TIER_BREAKOUT_PTS is unchanged (0.5) but
+        # now means "0.5x this pair's own ATR", matching the same
+        # atr_scale convention applied to SL/breakeven/trailing in
+        # custom_stoploss above, rather than a literal price delta.
         dataframe["breakout_magnitude_long"] = (
-            dataframe["close"] - dataframe["rolling_high_20"].shift(1)
+            (dataframe["close"] - dataframe["rolling_high_20"].shift(1))
+            / dataframe["atr"].replace(0, np.nan)
         )
         dataframe["breakout_magnitude_short"] = (
-            dataframe["rolling_low_20"].shift(1) - dataframe["close"]
+            (dataframe["rolling_low_20"].shift(1) - dataframe["close"])
+            / dataframe["atr"].replace(0, np.nan)
         )
+        dataframe["breakout_magnitude_long"] = dataframe["breakout_magnitude_long"].fillna(0.0)
+        dataframe["breakout_magnitude_short"] = dataframe["breakout_magnitude_short"].fillna(0.0)
         # Tick-consistency has no candle-level equivalent (it is inherently a
         # sub-candle, tick-by-tick property in the blueprint). As an honest
         # proxy we use "did the last 3 candles close in the breakout
@@ -1687,18 +1704,26 @@ class v12_Strategy(IStrategy):
 
         # --- Ranging entries: bounce off local low/high -------------------
         # "lowestPrice + 2pt bounce" for long; symmetric high-2pt for short.
+        # CROSS-PAIR SCALE FIX (2026-09-07): "2.0" was a raw price-point
+        # literal from the blueprint's single-pair (BTC) example — same
+        # issue as breakout_magnitude/SL/breakeven/trailing above.
+        # Replaced with 2.0 x this candle's own ATR, so the bounce
+        # threshold scales with each pair's real volatility/price range
+        # instead of being a fixed $2.00 that's meaningless on PEPE and
+        # negligible on BTC.
         ranging = dataframe["regime"] == "ranging"
+        ranging_bounce_dist = 2.0 * dataframe["atr"]
         ranging_long_trigger = (
             ranging
             & long_direction_ok
-            & (dataframe["close"] >= dataframe["rolling_low_20"] + 2.0)
-            & (dataframe["close"].shift(1) < dataframe["rolling_low_20"].shift(1) + 2.0)
+            & (dataframe["close"] >= dataframe["rolling_low_20"] + ranging_bounce_dist)
+            & (dataframe["close"].shift(1) < dataframe["rolling_low_20"].shift(1) + ranging_bounce_dist.shift(1))
         )
         ranging_short_trigger = (
             ranging
             & short_direction_ok
-            & (dataframe["close"] <= dataframe["rolling_high_20"] - 2.0)
-            & (dataframe["close"].shift(1) > dataframe["rolling_high_20"].shift(1) - 2.0)
+            & (dataframe["close"] <= dataframe["rolling_high_20"] - ranging_bounce_dist)
+            & (dataframe["close"].shift(1) > dataframe["rolling_high_20"].shift(1) - ranging_bounce_dist.shift(1))
         )
 
         dataframe.loc[trend_long_trigger | ranging_long_trigger, "enter_long"] = 1
@@ -2054,7 +2079,29 @@ class v12_Strategy(IStrategy):
         # by reading state["regime"] once a trade has one; the fresh
         # detection below now only ever executes on the FIRST call for a
         # given trade (state is None), which is the only time it should.
+        #
+        # RESTART-SAFE STATE FIX (2026-09-07): _active_sl_state was pure
+        # in-memory — a bot restart mid-trade (which can now legitimately
+        # happen more often given the watchdog force-close/kill-switch
+        # rebuild added in bot_loop_start) used to wipe this trade's
+        # Active-SL checkpoint entirely, silently falling back into the
+        # "first call" branch and recomputing a fresh entry_adaptive_sl_pts
+        # as if the trade had just opened, even hours into a real trade.
+        # Fix: if in-memory state is missing, try to restore it from
+        # Freqtrade's own custom_data store (see the set_custom_data call
+        # near where state is written, further down this method) before
+        # falling through to a genuine first-call computation.
         state = self._active_sl_state.get(trade.id)
+        if state is None:
+            state = self._restore_active_sl_state(trade)
+            if state is not None:
+                self._active_sl_state[trade.id] = state
+                logger.info(
+                    "[Phase2.5-RestartRecovery] %s trade#%s: restored "
+                    "Active-SL state from persisted custom_data after a "
+                    "restart (in-memory state was empty).",
+                    pair, trade.id,
+                )
         if state is not None:
             regime = state["regime"]
         else:
@@ -2096,6 +2143,43 @@ class v12_Strategy(IStrategy):
             )
             entry_adaptive_sl_pts = base_sl * vol_ratio  # already clamped upstream
 
+            # CROSS-PAIR SCALE FIX (2026-09-07): every *_PTS constant in this
+            # file (BASE_SL_*_PTS, *_BREAKEVEN_TRIGGER_PTS, TRAILING_*_PTS,
+            # HIGH_TIER_BREAKOUT_PTS) was a fixed raw price-point value
+            # calibrated against the blueprint's original single-pair (BTC)
+            # illustrative example. This repo's actual pair_whitelist spans
+            # ~30 pairs from BTC (~$100,000+) to PEPE/SHIB (~$0.00001) — an
+            # 8.0pt stop is ~0.008% on BTC but many times PEPE's entire
+            # price, which is not a usable stop distance on either end.
+            # FIX: freeze this trade's ATR (already computed in
+            # populate_indicators as candle["atr"], ATR(14)) at entry as a
+            # per-pair "points-to-price" scale factor. Every place in this
+            # method that turns a *_PTS constant into an actual price
+            # offset now multiplies by this frozen atr_scale instead of
+            # treating the constant as a literal price delta — so an
+            # "8.0pt" stop means "8.0 x this pair's own ATR" on every pair,
+            # automatically calibrated to that pair's real volatility and
+            # price scale, rather than a fixed number that only ever made
+            # sense for one specific pair's price range. Frozen at entry
+            # (not recomputed later) for the same reason regime is frozen
+            # at entry (see AUDIT FIX E above) — a stable basis for the
+            # whole trade rather than one that silently drifts.
+            atr_scale = float(candle["atr"])
+            if not np.isfinite(atr_scale) or atr_scale <= 0:
+                # Fallback: no usable ATR yet (e.g. still in warmup despite
+                # startup_candle_count, or a zero/NaN ATR candle) — fall
+                # back to treating the constant as a fraction of current
+                # price instead of silently using atr_scale=0 (which would
+                # collapse every stop/breakeven/trailing distance to zero
+                # and place a stop AT the entry price).
+                atr_scale = current_rate * 0.001
+                logger.warning(
+                    "[Phase2.5-ScaleFix] %s trade#%s: ATR unavailable/"
+                    "invalid at entry (%.6f); falling back to 0.1%% of "
+                    "current_rate=%.8f as atr_scale.",
+                    pair, trade.id, candle["atr"], current_rate,
+                )
+
             state = {
                 "regime": regime,
                 "entry_adaptive_sl_pts": entry_adaptive_sl_pts,
@@ -2118,6 +2202,7 @@ class v12_Strategy(IStrategy):
                 # after-fill ratchet exception (which cannot reach a
                 # 60s-delayed checkpoint, per the trace above).
                 "widest_sl_pts_seen": entry_adaptive_sl_pts,
+                "atr_scale": atr_scale,  # CROSS-PAIR SCALE FIX: see comment above.
                 "breakeven_armed": False,
                 "trailing_high_water": current_rate,  # Tracks the position's
                     # favorable-direction extreme since entry: highest price
@@ -2464,12 +2549,18 @@ class v12_Strategy(IStrategy):
         # PHASE 3: Capital Shield — breakeven trigger (frozen at entry
         # multiplier, per blueprint: breakeven/trailing are NOT touched by
         # the Phase 3.5 checkpoint, only the SL value is).
+        #
+        # CROSS-PAIR SCALE FIX: multiplied by state["atr_scale"] (frozen at
+        # entry) so this trigger is a real, pair-appropriate price
+        # distance instead of the same raw point value regardless of
+        # whether the pair is BTC or PEPE — see the entry-time comment
+        # above for the full reasoning.
         # ---------------------------------------------------------------
         breakeven_trigger_pts = (
             self.RANGING_BREAKEVEN_TRIGGER_PTS
             if regime == "ranging"
             else self.TRENDING_BREAKEVEN_TRIGGER_PTS
-        ) * state["entry_volatility_ratio"]  # frozen entry multiplier, per blueprint
+        ) * state["entry_volatility_ratio"] * state["atr_scale"]  # frozen entry multiplier, per blueprint
 
         profit_pts = (
             (current_rate - trade.open_rate)
@@ -2486,12 +2577,14 @@ class v12_Strategy(IStrategy):
 
         # ---------------------------------------------------------------
         # PHASE 4: Profit Trailing — also frozen at entry multiplier.
+        # CROSS-PAIR SCALE FIX: same atr_scale multiplication as breakeven
+        # above, same reasoning.
         # ---------------------------------------------------------------
         trailing_distance_pts = (
             self.TRAILING_RANGING_PTS
             if regime == "ranging"
             else self.TRAILING_TRENDING_PTS
-        ) * state["entry_volatility_ratio"]
+        ) * state["entry_volatility_ratio"] * state["atr_scale"]
 
         if is_long:
             state["trailing_high_water"] = max(state["trailing_high_water"], current_rate)
@@ -2521,14 +2614,14 @@ class v12_Strategy(IStrategy):
         # 60s-delayed checkpoint — see _ft_stop_uses_after_fill comment).
         # ---------------------------------------------------------------
         if is_long:
-            active_sl_price = trade.open_rate - active_sl_pts
+            active_sl_price = trade.open_rate - (active_sl_pts * state["atr_scale"])
             candidate_price = active_sl_price
             if state["breakeven_armed"]:
                 candidate_price = max(candidate_price, trade.open_rate)
             if state["trailing_armed"]:
                 candidate_price = max(candidate_price, trail_trigger_price)
         else:
-            active_sl_price = trade.open_rate + active_sl_pts
+            active_sl_price = trade.open_rate + (active_sl_pts * state["atr_scale"])
             candidate_price = active_sl_price
             if state["breakeven_armed"]:
                 candidate_price = min(candidate_price, trade.open_rate)
@@ -2580,6 +2673,18 @@ class v12_Strategy(IStrategy):
         # block above), so stop_ratio should already be a plain float by the
         # time it gets here — this cast is a cheap guarantee, not the fix
         # itself, matching this file's existing guard-at-both-ends pattern.
+
+        # RESTART-SAFE STATE FIX (2026-09-07): persist the current state to
+        # Freqtrade's own custom_data store on every call, not just at
+        # entry. This is cheap (small JSON blob, one upsert) and means a
+        # restart at ANY point in the trade's life — not just before the
+        # first checkpoint — recovers the correct checkpoint_done,
+        # widest_sl_pts_seen, breakeven_armed, and trailing_armed flags
+        # instead of silently resetting them via the restore-at-entry-only
+        # path above. See _persist_active_sl_state/_restore_active_sl_state
+        # near the end of this class for the actual custom_data read/write.
+        self._persist_active_sl_state(trade, state)
+
         return float(stop_ratio)
 
     # =====================================================================
@@ -3164,29 +3269,187 @@ class v12_Strategy(IStrategy):
                 pair, trade_id, event, exc,
             )
 
-    # def _rebuild_kill_switch_from_trade_history(self) -> None:
-    #     """
-    #     FIDELITY GAP #5 stub. Not called anywhere in this file.
-    #
-    #     self._sl_streak and self._kill_switch_flagged are in-memory dicts
-    #     that reset to empty on every bot restart. If you want Phase 5's
-    #     "24hr window" to survive restarts, rebuild the streaks from
-    #     Freqtrade's own trade database on startup instead, e.g.:
-    #
-    #         from freqtrade.persistence import Trade
-    #         cutoff = datetime.now(timezone.utc) - timedelta(
-    #             hours=self.KILL_SWITCH_WINDOW_HOURS
-    #         )
-    #         closed_trades = Trade.get_trades(
-    #             [Trade.close_date >= cutoff, Trade.is_open == False]
-    #         ).order_by(Trade.close_date.asc())
-    #         for t in closed_trades:
-    #             if t.exit_reason and "stop_loss" in t.exit_reason.lower():
-    #                 self._sl_streak.setdefault(t.pair, []).append(t.close_date)
-    #         # then re-run the len(...) >= KILL_SWITCH_CONSECUTIVE_SL check
-    #         # per pair to re-derive self._kill_switch_flagged.
-    #
-    #     Call this from bot_loop_start() or a similar startup hook if you
-    #     add it — not called anywhere by default in this file.
-    #     """
-    #     pass
+    _ACTIVE_SL_CUSTOM_DATA_KEY = "v12_active_sl_state"
+
+    def _persist_active_sl_state(self, trade: Trade, state: dict) -> None:
+        """
+        RESTART-SAFE STATE FIX (2026-09-07). Writes this trade's current
+        Active-SL state (regime, checkpoint progress, widest_sl_pts_seen,
+        breakeven/trailing armed flags, atr_scale, etc.) to Freqtrade's own
+        per-trade custom_data store via trade.set_custom_data(), which is
+        backed by the same trades database this bot already persists to
+        (Postgres/Neon per DEPLOY_GUIDE.md, or SQLite locally) — so it
+        survives a process restart the same way trade rows themselves do.
+        Called on every custom_stoploss return; a small JSON upsert is
+        cheap relative to the rest of this method and far cheaper than
+        silently losing checkpoint state on a restart.
+        """
+        try:
+            trade.set_custom_data(key=self._ACTIVE_SL_CUSTOM_DATA_KEY, value=state)
+        except Exception:
+            logger.exception(
+                "[Phase2.5-Persist] trade#%s: failed to persist Active-SL "
+                "state to custom_data. Trading continues normally off the "
+                "in-memory copy; only restart-recovery for this trade is "
+                "affected.",
+                trade.id,
+            )
+
+    def _restore_active_sl_state(self, trade: Trade) -> Optional[dict]:
+        """
+        Counterpart to _persist_active_sl_state above. Called from
+        custom_stoploss when in-memory self._active_sl_state has no entry
+        for this trade (e.g. right after a restart) — attempts to recover
+        the last-persisted state from custom_data instead of silently
+        treating an hours-old trade as brand new.
+        """
+        try:
+            value = trade.get_custom_data(key=self._ACTIVE_SL_CUSTOM_DATA_KEY, default=None)
+        except Exception:
+            logger.exception(
+                "[Phase2.5-Persist] trade#%s: failed to read persisted "
+                "Active-SL state from custom_data. Falling back to "
+                "first-call computation as before this fix.",
+                trade.id,
+            )
+            return None
+
+        if not isinstance(value, dict):
+            return None
+
+        required_keys = {
+            "regime", "entry_adaptive_sl_pts", "entry_volatility_ratio",
+            "checkpoint_done", "widest_sl_pts_seen", "atr_scale",
+            "breakeven_armed", "trailing_high_water", "trailing_armed",
+        }
+        if not required_keys.issubset(value.keys()):
+            logger.warning(
+                "[Phase2.5-Persist] trade#%s: persisted custom_data is "
+                "missing expected keys; discarding and falling back to "
+                "first-call computation rather than operating on a "
+                "partial/corrupt state.",
+                trade.id,
+            )
+            return None
+
+        return value
+
+    def _rebuild_kill_switch_from_trade_history(self) -> None:
+        """
+        FIDELITY GAP #5 fix — WIRED (2026-09-07). Previously a dead,
+        commented-out stub never called anywhere; now actually runs from
+        bot_loop_start() below.
+
+        self._sl_streak and self._kill_switch_flagged are in-memory dicts
+        that reset to empty on every bot restart. This rebuilds Phase 5's
+        "24hr consecutive-SL" window from Freqtrade's own trade database on
+        startup, so a crash/restart (see WATCHDOG below) no longer silently
+        erases the kill-switch's memory.
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                hours=self.KILL_SWITCH_WINDOW_HOURS
+            )
+            closed_trades = Trade.get_trades(
+                [Trade.close_date >= cutoff, Trade.is_open == False]
+            ).order_by(Trade.close_date.asc())
+            for t in closed_trades:
+                if t.exit_reason and "stop_loss" in t.exit_reason.lower():
+                    self._sl_streak.setdefault(t.pair, []).append(t.close_date)
+            for pair, streak in self._sl_streak.items():
+                if len(streak) >= self.KILL_SWITCH_CONSECUTIVE_SL:
+                    self._kill_switch_flagged[pair] = True
+                    logger.warning(
+                        "[KillSwitch] Rebuilt from trade history on startup: "
+                        "%s has %d consecutive SL exits within %dh -> "
+                        "flagged (new entries blocked).",
+                        pair, len(streak), self.KILL_SWITCH_WINDOW_HOURS,
+                    )
+        except Exception:
+            logger.exception(
+                "[KillSwitch] Failed to rebuild kill-switch state from trade "
+                "history on startup. Continuing with empty in-memory state "
+                "(same as before this fix) rather than crashing the bot."
+            )
+
+    _watchdog_kill_switch_rebuilt = False
+
+    def bot_loop_start(self, current_time: datetime, **kwargs) -> None:
+        """
+        WATCHDOG (Tier-1 fix, 2026-09-07). Two jobs, both previously
+        missing entirely from this file:
+
+        1. One-time on first loop iteration: rebuild kill-switch state
+           from trade history (see _rebuild_kill_switch_from_trade_history
+           above) so a restart doesn't silently zero out the 24h
+           consecutive-SL counter.
+
+        2. Every loop iteration: scan all open trades. custom_exit's
+           timebomb logic only ever runs when Freqtrade calls
+           should_exit()/custom_exit() for a trade on its normal
+           per-candle path. If a pair's candle fetch hangs or stalls
+           (exchange glitch, rate limit, network issue), that trade's
+           timebomb machinery never fires at all — it can stay open
+           indefinitely. Combined with max_open_trades=1, one stalled
+           trade freezes the entire bot from taking any new signal.
+           This force-closes any trade left open for more than
+           2x TRENDING_TIMEBOMB_SECONDS as a hard backstop, and logs
+           loudly so it's visible this happened.
+        """
+        if not self._watchdog_kill_switch_rebuilt:
+            self._watchdog_kill_switch_rebuilt = True
+            self._rebuild_kill_switch_from_trade_history()
+
+        watchdog_limit_seconds = 2 * self.TRENDING_TIMEBOMB_SECONDS
+
+        try:
+            open_trades = Trade.get_trades_proxy(is_open=True)
+        except Exception:
+            logger.exception(
+                "[Watchdog] Failed to fetch open trades this loop; "
+                "skipping stuck-trade check for this iteration only."
+            )
+            return
+
+        for trade in open_trades:
+            opened_at = trade.open_date_utc
+            if opened_at is None:
+                continue
+            age_seconds = (current_time - opened_at).total_seconds()
+            if age_seconds <= watchdog_limit_seconds:
+                continue
+
+            logger.warning(
+                "[Watchdog] Trade#%s (%s) open for %.0fs, exceeding "
+                "%.0fs (2x TRENDING_TIMEBOMB_SECONDS=%ds) watchdog limit. "
+                "This trade's normal exit path likely stalled (stale "
+                "candles / exchange issue). Force-closing now so a single "
+                "stuck trade cannot freeze the whole bot under "
+                "max_open_trades=1.",
+                trade.id, trade.pair, age_seconds,
+                watchdog_limit_seconds, self.TRENDING_TIMEBOMB_SECONDS,
+            )
+            try:
+                self.execute_trade_exit(
+                    trade=trade,
+                    limit=trade.close_rate or trade.open_rate,
+                    exit_check=self._make_watchdog_exit_check(),
+                )
+            except Exception:
+                logger.exception(
+                    "[Watchdog] Force-close attempt failed for trade#%s "
+                    "(%s). Will retry next loop iteration.",
+                    trade.id, trade.pair,
+                )
+
+    @staticmethod
+    def _make_watchdog_exit_check():
+        """
+        Small helper building the ExitCheckTuple execute_trade_exit()
+        expects, tagged with a distinct exit_reason so 'watchdog_stuck_
+        trade' is greppable/visible in trade history and CSV exports,
+        separate from the normal timebomb/checkpoint exit reasons.
+        """
+        from freqtrade.enums import ExitType
+        from freqtrade.persistence.models import ExitCheckTuple
+        return ExitCheckTuple(exit_type=ExitType.CUSTOM_EXIT, exit_reason="watchdog_stuck_trade")
