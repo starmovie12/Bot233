@@ -133,6 +133,88 @@
 # Delta Exchange, fixed separately) — these are defects that would have
 # stayed silent until specific, harder-to-notice conditions occurred later.
 # =============================================================================
+# 2026-09-08 FEATURE ADDITION — Part 9: Structure-Aware Exit, Regime Tagging,
+# Hyperopt-Searchable Parameters.
+#
+# This is new capability, not a bug fix — unlike AUDIT FIX A-Q above (all of
+# which corrected code that was already trying to do the right thing), Part 9
+# changes what the exit logic itself decides. Per the backtest report's own
+# framing (search "Part 9" in v12_Strategy_Backtest_Analysis.md), the fixes
+# through Q made the exit less premature; they never made it read whether the
+# trade's own setup was still valid. Following this file's own convention
+# (see the "2026-09-06 FEATURE ADDITION" block above for the SMC gate), this
+# gets a dated FEATURE ADDITION block, not an AUDIT FIX letter — the letter
+# sequence (A-Q) is reserved for defects, and nothing here is one.
+#
+# Three changes, built and documented in the report's stated order:
+#
+#   PART 9.2 — STRUCTURE-INVALIDATED EXIT (custom_exit, new state key
+#   "entry_structure_level" frozen in custom_stoploss's first-call branch).
+#   custom_exit previously knew only two things: elapsed time, and whether
+#   profit crossed one fixed threshold (AUDIT FIX J/L) — it had no read on
+#   whether the specific level that justified entry (the 20-candle breakout
+#   for a Trending trade, the opposite-side extreme for a Ranging bounce)
+#   was still intact. A new structure_invalidated_exit check now runs FIRST
+#   in custom_exit, ahead of the timebomb block: if price closes back
+#   through that frozen level, the trade's entry thesis is dead and it exits
+#   immediately, regardless of how much time is left on the timer. This is
+#   additive and backward-compatible — a trade whose state predates this
+#   field (entry_structure_level missing/None) simply skips the check and
+#   falls through to the existing timer logic unchanged, exactly as the
+#   report specifies. See custom_stoploss (state dict, first-call branch)
+#   and custom_exit (the new check, first block in the method body) for the
+#   two halves of this.
+#
+#   PART 9.3 — ENTER_TAG REGIME LABELING (populate_entry_trend). Before this,
+#   every trade's enter_tag defaulted to Freqtrade's own "OTHER" — the
+#   regime a trade opened under existed only in this file's own in-memory
+#   state, invisible to Freqtrade's standard ENTER TAG STATS backtest table.
+#   Now each of the four trigger branches (trend_long, trend_short,
+#   ranging_long, ranging_short) stamps dataframe["enter_tag"] with
+#   "trending" or "ranging" at the exact candle each fires — a one-line
+#   addition per branch, no logic change. This is the concrete, smallest
+#   possible change that finally unblocks AUDIT FIX P's open question (is
+#   RANGING_TIMEBOMB_SECONDS=60 actually fine, or does it need Part 9.2's
+#   structure-check treatment too?) — the next backtest run's own standard
+#   output now gives a regime-split breakdown with zero custom analysis
+#   needed.
+#
+#   PART 9.4 — HYPEROPT-SEARCHABLE PARAMETERS. Every constant this file has
+#   tuned by hand so far (AUDIT FIX I/J/L's included, plus every pre-existing
+#   entry/exit/sizing/regime-detection threshold) was a plain Python class
+#   attribute, invisible to Freqtrade's Hyperopt machinery (confirmed before
+#   this change: zero IntParameter/DecimalParameter declarations anywhere in
+#   this file). Genuinely tuning-relevant constants — ones that gate an entry
+#   decision, size a stop, arm a trailing distance, or set an exit ceiling —
+#   are now DecimalParameter/IntParameter Hyperopt-space declarations
+#   instead. Every call site inside this file was updated to the new
+#   lowercase name with explicit .value. The original UPPERCASE names are
+#   also kept, as a SEPARATE "AUDIT-HISTORY ALIASES" class-attribute block
+#   right after the Hyperopt declarations — same underlying Parameter
+#   object, two names — so an old external reference using .value on the
+#   old name (a saved Hyperopt results file, an external script) does not
+#   hard-crash with AttributeError. This does NOT restore old-style bare-
+#   name arithmetic (self.OLD_NAME * x): confirmed directly against
+#   freqtrade's own BaseParameter source that it defines no numeric dunder
+#   methods at all, so .value was always required, alias or not — see the
+#   alias block's own comment for the full, precise scope of what backward
+#   compatibility this does and does not provide. Constants that are purely
+#   operational/bookkeeping (kill-switch window hours, log-throttle
+#   seconds, Medium-tier wait cycle count, indicator-averaging window
+#   sizes) are deliberately left as plain constants — they don't represent
+#   a trading edge to search over, and Hyperopt-izing them would be scope
+#   creep beyond what Part 9.4 asks for. Built last, per the report's own
+#   build-order reasoning: Hyperopt only produces a trustworthy answer once
+#   there's a structure-aware rule worth optimizing the parameters of
+#   (Part 9.2), not just the least-bad blind-timeout value for a rule
+#   that's still fundamentally a clock.
+#
+# None of Part 9's three changes touch custom_stoploss's Active-SL/breakeven/
+# trailing resolution math, the watchdog (AUDIT FIX N/Q), the kill-switch
+# (AUDIT FIX D/M), or the SMC gate (AUDIT FIX C/O) — confirmed at each change
+# point below with an inline note, matching the report's own explicit scope
+# statement for Part 9.2 ("does not touch... at all").
+# =============================================================================
 # 2026-09-06 AUDIT PASS — one additional defect found and fixed, specifically
 # while investigating why realized trade losses looked larger than the
 # strategy's own stated stop-loss sizing should allow:
@@ -479,6 +561,8 @@ from pandas import DataFrame, Series  # Series ADDED: the ported functions'
                                        # return is a multi-column DataFrame.
 
 from freqtrade.strategy import (
+    DecimalParameter,
+    IntParameter,
     IStrategy,
     Trade,
     stoploss_from_absolute,
@@ -1186,49 +1270,97 @@ class v12_Strategy(IStrategy):
     # =====================================================================
 
     # --- Phase 0: Regime Detection --------------------------------------
-    ADX_TRENDING_THRESHOLD = 25.0
-    ADX_RANGING_THRESHOLD = 20.0
-    # 20-25 is the Transition Zone -> skip. No backup range/HH-HL method is
-    # implemented here: Freqtrade already guarantees ADX/DMI availability
-    # every candle (no "ADX access down" scenario like the blueprint's
-    # discretionary-execution backup path was written for), so the
-    # blueprint's own backup-method branch is structurally inapplicable in
-    # this environment and is intentionally omitted rather than faked.
+    # PART 9.4 (2026-09-08): converted from plain class attributes to
+    # Hyperopt DecimalParameter spaces (see this file's FEATURE ADDITION
+    # header block for the full Part 9.4 rationale). Attribute names moved
+    # to lowercase per Freqtrade's own Hyperopt-parameter convention; every
+    # read site (populate_indicators, populate_entry_trend) now reads
+    # `.value`. Ranges are centered on the previous hand-guessed defaults,
+    # with room either side for Hyperopt to search — they are starting
+    # search spaces, not claims about the right answer, same "untested"
+    # status every threshold in this file has had from the start.
+    #
+    # adx_trending_threshold / adx_ranging_threshold: 20-25 remains the
+    # Transition Zone (skip) by construction, since populate_indicators'
+    # regime classification below uses one np.where(> trending, ...,
+    # np.where(< ranging, ..., "transition")) — as long as Hyperopt keeps
+    # adx_trending_threshold >= adx_ranging_threshold (the ranges below
+    # never let them invert: trending's floor of 20.0 sits at ranging's
+    # own ceiling of 20.0), the Transition Zone stays well-defined. No
+    # backup range/HH-HL method is implemented here: Freqtrade already
+    # guarantees ADX/DMI availability every candle (no "ADX access down"
+    # scenario like the blueprint's discretionary-execution backup path
+    # was written for), so the blueprint's own backup-method branch is
+    # structurally inapplicable in this environment and is intentionally
+    # omitted rather than faked. space="buy" (Freqtrade convention):
+    # these gate entry eligibility via the regime column.
+    adx_trending_threshold = DecimalParameter(
+        20.0, 35.0, default=25.0, decimals=1, space="buy", optimize=True
+    )
+    adx_ranging_threshold = DecimalParameter(
+        10.0, 20.0, default=20.0, decimals=1, space="buy", optimize=True
+    )
 
     # --- Phase 0.3: Direction Confidence Zone ---------------------------
-    DI_GAP_CONFIDENT_THRESHOLD = 4.0  # |+DI - -DI|, 3-reading avg
+    # di_gap_confident_threshold: |+DI - -DI|, 3-reading avg. space="buy":
+    # gates direction_confident, an entry-eligibility condition.
+    di_gap_confident_threshold = DecimalParameter(
+        2.0, 8.0, default=4.0, decimals=1, space="buy", optimize=True
+    )
 
     # --- Phase 0.4: Reading-Consistency Rule ----------------------------
     READING_AVG_WINDOW = 3  # bars, see FIDELITY GAP #2
 
     # --- Phase 1.5: Final Confirmation Gate tiers -----------------------
-    HIGH_TIER_ADX_MARGIN = 3.0
-    HIGH_TIER_DI_MARGIN = 2.0
-    HIGH_TIER_BREAKOUT_PTS = 0.5
+    # PART 9.4 (2026-09-08): high_tier_adx_margin/high_tier_di_margin/
+    # high_tier_breakout_pts/min_entry_breakout_pts converted to Hyperopt
+    # spaces (see FEATURE ADDITION header). space="buy": all four gate
+    # either entry eligibility (min_entry_breakout_pts) or the High-vs-
+    # Medium tier split, which in turn decides immediate-fire vs.
+    # wait-and-reverify — both are entry-side decisions.
+    high_tier_adx_margin = DecimalParameter(
+        1.0, 8.0, default=3.0, decimals=1, space="buy", optimize=True
+    )
+    high_tier_di_margin = DecimalParameter(
+        0.5, 6.0, default=2.0, decimals=1, space="buy", optimize=True
+    )
+    high_tier_breakout_pts = DecimalParameter(
+        0.2, 1.5, default=0.5, decimals=2, space="buy", optimize=True
+    )
     # Medium tier = margins positive (signal didn't outright fail) but below
     # High-tier thresholds. Low tier = margins barely-crossed-zero.
     MEDIUM_TIER_WAIT_CYCLES = 2  # "1-2 extra polling cycles" -> upper bound.
                                   # See FIDELITY GAP #1: this is iterations of
-                                  # the bot loop, not ticks.
+                                  # the bot loop, not ticks. Left as a plain
+                                  # constant (PART 9.4): an iteration count,
+                                  # not a trading-edge threshold — searching
+                                  # it doesn't answer a profitability
+                                  # question the way the *_PTS/margin
+                                  # constants above do.
 
     # AUDIT FIX I (2026-09-08): entry-trigger floor. See the full trace at
     # this constant's point of use in populate_entry_trend
     # (trend_long_trigger/trend_short_trigger) for why this exists — in
     # short, breakout_magnitude_{long,short} > 0 alone let ANY positive
     # clearance over the prior 20-candle high/low pass, no matter how small
-    # relative to the pair's own ATR. HIGH_TIER_BREAKOUT_PTS (0.5x ATR)
-    # already existed but was only ever applied AFTER trigger, deciding
-    # immediate-vs-wait-and-reverify timing, never entry eligibility itself.
-    # MIN_ENTRY_BREAKOUT_PTS reuses that same ATR-unit convention (see the
-    # "CROSS-PAIR SCALE FIX" comment on breakout_magnitude_* above) but at a
-    # deliberately lower bar than the High-tier threshold: this gates
-    # whether a trade is considered AT ALL, so it should stop noise-level
-    # breakouts (a few thousandths of an ATR) without also silently
-    # reproducing HIGH_TIER_BREAKOUT_PTS as a second, redundant ceiling that
-    # would leave the Medium tier with nothing left to classify. Untested,
-    # same as every other threshold in this file — tune empirically per
-    # item 3 of the backtest report before trusting this value specifically.
-    MIN_ENTRY_BREAKOUT_PTS = 0.15
+    # relative to the pair's own ATR. high_tier_breakout_pts (0.5x ATR
+    # default) already existed but was only ever applied AFTER trigger,
+    # deciding immediate-vs-wait-and-reverify timing, never entry
+    # eligibility itself. min_entry_breakout_pts reuses that same ATR-unit
+    # convention (see the "CROSS-PAIR SCALE FIX" comment on
+    # breakout_magnitude_* above) but at a deliberately lower bar than the
+    # High-tier threshold: this gates whether a trade is considered AT ALL,
+    # so it should stop noise-level breakouts (a few thousandths of an ATR)
+    # without also silently reproducing high_tier_breakout_pts as a second,
+    # redundant ceiling that would leave the Medium tier with nothing left
+    # to classify. PART 9.4: now a Hyperopt DecimalParameter (was a plain
+    # 0.15 constant) — range keeps its upper bound comfortably below
+    # high_tier_breakout_pts's own lower bound (0.2) so Hyperopt cannot
+    # search min_entry_breakout_pts past the point where it would collapse
+    # the Medium tier the way the comment above warns against.
+    min_entry_breakout_pts = DecimalParameter(
+        0.05, 0.19, default=0.15, decimals=2, space="buy", optimize=True
+    )
 
     # --- Phase 1.5 (SMC Extension): Structural Confirmation Gate --------
     # See "2026-09-06 FEATURE ADDITION" in the file header and FIDELITY
@@ -1241,70 +1373,131 @@ class v12_Strategy(IStrategy):
                               # populate normally, but they can never block
                               # a Trending entry — use this to A/B the
                               # tier-gate-only vs. tier-gate+SMC-gate
-                              # configurations against each other.
-    SMC_SWING_LENGTH = 5  # candles each side, fed to swing_highs_lows().
-                            # Deliberately far below the smc library's own
-                            # default of 50: every candle of swing_length
-                            # is a candle of forward data this strategy
-                            # cannot have yet at decision time (Gap #7), so
-                            # this is a starting point for the smallest
-                            # window that still produces a recognizable
-                            # swing/BOS/OB structure, traded off against
-                            # noisier, less structurally significant
-                            # "swings" than the library's own tested
-                            # default would produce. Re-tune this
-                            # explicitly before trusting the gate.
-    SMC_STRUCTURE_LOOKBACK_BARS = 15  # how far back (in candles) to scan
-                            # for a still-valid, already-confirmed BOS or
-                            # active Order Block. Kept at roughly
-                            # 3x SMC_SWING_LENGTH: a settled swing needs
-                            # ~SMC_SWING_LENGTH candles just to stop being
-                            # provisional (Gap #7), and BOS/CHoCH's own
-                            # break-confirmation needs an unbounded,
-                            # variable number MORE candles on top of that —
-                            # 3x is a heuristic margin, not a derived or
-                            # guaranteed-sufficient figure.
-    SMC_FVG_LOOKBACK_BARS = 2  # how many candles immediately BEHIND the
-                            # breakout candle to scan for an unmitigated,
-                            # same-direction FVG. Deliberately excludes the
-                            # breakout candle's own (unshifted) FVG value —
-                            # that value structurally cannot exist yet at
-                            # decision time, per Gap #7 — only shift(1)..
-                            # shift(SMC_FVG_LOOKBACK_BARS) are checked.
-    SMC_OB_MIN_PERCENTAGE = 60.0  # ob()'s Percentage field (0-100,
-                            # min(highVolume,lowVolume)/max(...)*100 across
-                            # the 3 candles around the breakout that
-                            # created the block) must clear this to count
-                            # as a genuine, two-sided-enough push per the
-                            # blueprint's "a low score flags a thin,
-                            # one-sided push" framing.
-    SMC_MIN_CONFIRMATIONS = 2  # of 3 (FVG, BOS, OB) required to pass the
-                            # gate — the blueprint's own "2-of-3 (or all 3)"
-                            # framing. Set to 3 for the strictest reading.
+                              # configurations against each other. Left as
+                              # a plain bool (PART 9.4): an on/off toggle,
+                              # not a numeric search space.
+    # PART 9.4 (2026-09-08): the five constants below converted to Hyperopt
+    # spaces. smc_swing_length/smc_fvg_lookback_bars feed a real int into
+    # swing_highs_lows()'s swing_length= kwarg and a Python range() call
+    # respectively (populate_indicators) — both call sites now read
+    # `.value` explicitly, since an IntParameter behaves like its numeric
+    # value in arithmetic/comparisons but range()/external-function kwargs
+    # need the genuine int, not the parameter wrapper. All five use
+    # space="buy": every one gates whether a Trending entry passes the SMC
+    # confirmation gate, an entry-side decision.
+    smc_swing_length = IntParameter(
+        3, 12, default=5, space="buy", optimize=True
+    )  # candles each side, fed to swing_highs_lows(). Deliberately far
+       # below the smc library's own default of 50: every candle of
+       # swing_length is a candle of forward data this strategy cannot
+       # have yet at decision time (Gap #7), so this is a starting point
+       # for the smallest window that still produces a recognizable
+       # swing/BOS/OB structure, traded off against noisier, less
+       # structurally significant "swings" than the library's own tested
+       # default would produce.
+    smc_structure_lookback_bars = IntParameter(
+        6, 40, default=15, space="buy", optimize=True
+    )  # how far back (in candles) to scan for a still-valid, already-
+       # confirmed BOS or active Order Block. Default kept at roughly 3x
+       # smc_swing_length's own default: a settled swing needs
+       # ~smc_swing_length candles just to stop being provisional (Gap
+       # #7), and BOS/CHoCH's own break-confirmation needs an unbounded,
+       # variable number MORE candles on top of that — 3x is a heuristic
+       # margin, not a derived or guaranteed-sufficient figure. Hyperopt
+       # searches this independently of smc_swing_length (Freqtrade does
+       # not support one parameter's range depending on another's current
+       # sample), so an epoch could in principle pick a lookback narrower
+       # than 3x that epoch's swing_length — a looser heuristic than the
+       # original fixed 3x relationship, flagged here rather than
+       # silently assumed still enforced.
+    smc_fvg_lookback_bars = IntParameter(
+        1, 5, default=2, space="buy", optimize=True
+    )  # how many candles immediately BEHIND the breakout candle to scan
+       # for an unmitigated, same-direction FVG. Deliberately excludes the
+       # breakout candle's own (unshifted) FVG value — that value
+       # structurally cannot exist yet at decision time, per Gap #7 — only
+       # shift(1)..shift(smc_fvg_lookback_bars.value) are checked.
+    smc_ob_min_percentage = DecimalParameter(
+        40.0, 85.0, default=60.0, decimals=1, space="buy", optimize=True
+    )  # ob()'s Percentage field (0-100, min(highVolume,lowVolume)/
+       # max(...)*100 across the 3 candles around the breakout that
+       # created the block) must clear this to count as a genuine,
+       # two-sided-enough push per the blueprint's "a low score flags a
+       # thin, one-sided push" framing.
+    smc_min_confirmations = IntParameter(
+        1, 3, default=2, space="buy", optimize=True
+    )  # of 3 (FVG, BOS, OB) required to pass the gate — the blueprint's
+       # own "2-of-3 (or all 3)" framing. 3 is the strictest reading.
 
     # --- Phase 2: Position Sizing (Trending) ----------------------------
+    # SIZING_ADX_HIGH / SIZING_DI_GAP_MIN: confirmed zero call sites
+    # anywhere in this file (grepped before Part 9.4 was written) — dead
+    # constants, left untouched. Converting an unused constant to a
+    # Hyperopt space would search a value nothing reads, which is not
+    # what Part 9.4 asks for.
     SIZING_ADX_HIGH = 30.0
     SIZING_DI_GAP_MIN = 4.0
 
     # --- Phase 2.5: Adaptive Stop-Loss Sizing ---------------------------
-    BASE_SL_TRENDING_PTS = 8.0
-    BASE_SL_RANGING_PTS = 4.0
+    # PART 9.4: base_sl_trending_pts/base_sl_ranging_pts converted —
+    # space="sell" (Freqtrade convention: these size the stop-loss, an
+    # exit-side/risk parameter, even though they're read at entry time to
+    # freeze the trade's stop basis). volatility_ratio's own clamp bounds
+    # are left as plain constants: they're a sanity floor/ceiling on a
+    # computed ratio, not an independent trading-edge threshold, and
+    # letting Hyperopt search them independently of each other risks an
+    # epoch where the floor exceeds the ceiling with nothing to catch it.
+    base_sl_trending_pts = DecimalParameter(
+        4.0, 15.0, default=8.0, decimals=1, space="sell", optimize=True
+    )
+    base_sl_ranging_pts = DecimalParameter(
+        2.0, 8.0, default=4.0, decimals=1, space="sell", optimize=True
+    )
     VOLATILITY_RATIO_CLAMP_MIN = 0.5
     VOLATILITY_RATIO_CLAMP_MAX = 2.0
     ATR_PERIOD = 14
     VOLATILITY_BASELINE_PERIOD = 20  # rolling baseline window for ATR ratio
 
     # --- Phase 3: Capital Shield -----------------------------------------
-    RANGING_BREAKEVEN_TRIGGER_PTS = 2.0
+    # PART 9.4 (2026-09-08): ranging_breakeven_trigger_pts and
+    # trending_breakeven_trigger_pts converted to Hyperopt DecimalParameters
+    # (space="sell": breakeven-arming distances are an exit-side/risk
+    # decision). ranging_timebomb_seconds and trending_timebomb_seconds
+    # below converted to Hyperopt IntParameters (space="sell": both are
+    # exit-ceiling ranges) — this does NOT reopen or override AUDIT FIX P's
+    # deliberate "flagged, not changed" decision on the ranging side; the
+    # default stays 60 exactly as Fix P left it, and every word of Fix P's
+    # reasoning below is unchanged. Converting the constant to a searchable
+    # range is a different action from raising its default — Hyperopt can
+    # only search AROUND 60 if a hyperopt run is actually invoked with
+    # space="sell" included; the strategy's own default/non-hyperopt
+    # behavior is bit-for-bit identical to pre-Part-9.4 (reads
+    # ranging_timebomb_seconds.value, which equals 60 unless Hyperopt has
+    # actually run and written a different value to disk).
+    ranging_breakeven_trigger_pts = DecimalParameter(
+        1.0, 5.0, default=2.0, decimals=1, space="sell", optimize=True
+    )
     # AUDIT FIX P (2026-09-08): flagged, NOT changed — see this constant's
     # own detailed comment further down (search "AUDIT FIX P" near
     # custom_exit) for why 60s was never actually checked against Root
     # Cause #2's own reasoning, and why this file is NOT silently raising
     # it the way AUDIT FIX L raised TRENDING_TIMEBOMB_SECONDS. Read that
     # comment before assuming either that 60s is fine, or that it needs
-    # the same fix trending got.
-    RANGING_TIMEBOMB_SECONDS = 60  # adaptive, scaled by volatility ratio
-    TRENDING_BREAKEVEN_TRIGGER_PTS = 4.5  # blueprint gives 4-5pt; midpoint
+    # the same fix trending got. PART 9.4: the range below (30-900s) is
+    # centered on this same untouched 60s default — Fix P's own "don't
+    # guess by analogy, wait for regime-split data" reasoning is exactly
+    # why this is a SEARCH SPACE rather than a hand-raised new default:
+    # Hyperopt will only move away from 60s if the data (once Part 9.3's
+    # enter_tag split exists) actually supports doing so, which is a
+    # strictly more evidence-driven path than either leaving it a fixed
+    # constant forever or hand-guessing a new number the way this exact
+    # comment has been warning against since Part 7.
+    ranging_timebomb_seconds = IntParameter(
+        30, 900, default=60, space="sell", optimize=True
+    )  # adaptive, scaled by volatility ratio — see custom_exit.
+    trending_breakeven_trigger_pts = DecimalParameter(
+        2.0, 8.0, default=4.5, decimals=1, space="sell", optimize=True
+    )  # blueprint gives 4-5pt; midpoint default unchanged by Part 9.4.
 
     # AUDIT FIX L (2026-09-08): TRENDING_TIMEBOMB_SECONDS raised from 105
     # to 1200 (20 minutes). This is the "larger fix" from the 2026-09-08
@@ -1378,14 +1571,19 @@ class v12_Strategy(IStrategy):
     # timer would have cut off sooner), the report's original "midpoint
     # between two extremes" methodology can be reapplied between the old
     # 105s and this new 1200s ceiling.
-    TRENDING_TIMEBOMB_SECONDS = 1200  # was 105 (blueprint's 90-120s
-                                      # midpoint) before AUDIT FIX L; see
-                                      # that fix's comment block above for
-                                      # the full derivation and tradeoffs.
-                                      # Still NOT adaptive (per blueprint
-                                      # text) — this raises the fixed
-                                      # ceiling itself, it does not make it
-                                      # volatility-scaled.
+    #
+    # PART 9.4 (2026-09-08): converted to a Hyperopt IntParameter. The
+    # report's own Part 9.4 example (see the FEATURE ADDITION header block)
+    # gives this exact constant's range as "300-1800, centered on Fix L's
+    # reasoned 1200" — used verbatim below. Still NOT adaptive by
+    # volatility (per blueprint text) even as a search space — this
+    # searches the fixed ceiling's VALUE, it does not make the ceiling
+    # itself volatility-scaled.
+    trending_timebomb_seconds = IntParameter(
+        300, 1800, default=1200, space="sell", optimize=True
+    )  # was 105 (blueprint's 90-120s midpoint) before AUDIT FIX L; see
+       # that fix's comment block above for the full derivation and
+       # tradeoffs.
 
     # AUDIT FIX J (2026-09-08): profit-aware timebomb floor. See custom_exit
     # below for the full trace. current_profit was accepted as a parameter
@@ -1413,16 +1611,137 @@ class v12_Strategy(IStrategy):
     # trade below this profit level, or at a loss, is still time-bombed —
     # just now at 1200s instead of 105s, per AUDIT FIX L. Untested, same
     # as every other threshold in this file.
-    TIMEBOMB_PROFIT_EXEMPT_PTS = 2.0
+    #
+    # PART 9.4 (2026-09-08): converted to a Hyperopt DecimalParameter — the
+    # report's own Part 9.4 example gives this exact constant's range as
+    # "0.5-4.0, centered on 2.0", used verbatim below. space="sell": this
+    # gates the timebomb exit, an exit-side decision.
+    timebomb_profit_exempt_pts = DecimalParameter(
+        0.5, 4.0, default=2.0, decimals=1, space="sell", optimize=True
+    )
 
     # --- Phase 3.5: Mid-Trade Checkpoint (Trending only) ----------------
-    CHECKPOINT_DELAY_SECONDS = 60
-    IV_CRUSH_TRIGGER_PTS = 20.0  # underlying-point proxy, see FIDELITY GAP #4
-    IV_CRUSH_TIGHTEN_MULTIPLIER = 0.7
+    # PART 9.4: checkpoint_delay_seconds/iv_crush_trigger_pts/
+    # iv_crush_tighten_multiplier converted to Hyperopt spaces. space="sell"
+    # for all three: the checkpoint reassesses and can tighten an already-
+    # open trade's stop, which is exit/risk-side behavior even though it
+    # fires mid-trade rather than at entry or at close.
+    checkpoint_delay_seconds = IntParameter(
+        20, 300, default=60, space="sell", optimize=True
+    )
+    iv_crush_trigger_pts = DecimalParameter(
+        5.0, 40.0, default=20.0, decimals=1, space="sell", optimize=True
+    )  # underlying-point proxy, see FIDELITY GAP #4
+    iv_crush_tighten_multiplier = DecimalParameter(
+        0.4, 0.9, default=0.7, decimals=2, space="sell", optimize=True
+    )
 
     # --- Phase 4: Profit Trailing ----------------------------------------
-    TRAILING_RANGING_PTS = 3.5  # blueprint gives 3-4pt; midpoint
-    TRAILING_TRENDING_PTS = 7.5  # blueprint gives 7-8pt; midpoint
+    # PART 9.4: space="sell" — trailing-stop arm distances are an exit-side
+    # decision by definition.
+    trailing_ranging_pts = DecimalParameter(
+        1.5, 6.0, default=3.5, decimals=1, space="sell", optimize=True
+    )  # blueprint gives 3-4pt; midpoint default unchanged by Part 9.4.
+    trailing_trending_pts = DecimalParameter(
+        4.0, 12.0, default=7.5, decimals=1, space="sell", optimize=True
+    )  # blueprint gives 7-8pt; midpoint default unchanged by Part 9.4.
+
+    # =========================================================================
+    # AUDIT-HISTORY ALIASES (PART 9.4, 2026-09-08).
+    #
+    # Every constant above was, before Part 9.4, a plain UPPERCASE class
+    # attribute (e.g. BASE_SL_TRENDING_PTS = 8.0). It is now a lowercase
+    # DecimalParameter/IntParameter instance instead (base_sl_trending_pts).
+    # Every call site INSIDE this file has already been updated to the new
+    # lowercase name + explicit .value (confirmed: zero remaining
+    # self.OLD_UPPERCASE_NAME references anywhere in this file's executable
+    # code). These aliases exist for a DIFFERENT reason: any reference to
+    # the OLD name from OUTSIDE this file's own call sites — a saved
+    # Hyperopt results JSON from before this upgrade, an external
+    # monitoring/analytics script, a REPL/notebook session, anything that
+    # was written against the pre-Part-9.4 UPPERCASE names — would
+    # otherwise raise AttributeError the moment this file loads with none
+    # of the old names present at all.
+    #
+    # WHAT THIS ALIAS DOES AND DOES NOT FIX — stated precisely, because an
+    # earlier version of the comment above this block (see the "PART 9.4"
+    # entry in the 2026-09-08 FEATURE ADDITION header near the top of this
+    # file) claimed this makes "every existing call site keep working
+    # unmodified," which is only half true and would mislead the next
+    # reader if left uncorrected:
+    #
+    #   - self.OLD_NAME.value now resolves correctly (this alias makes
+    #     OLD_NAME point at the exact same DecimalParameter/IntParameter
+    #     instance as the new lowercase name — same object, two names, so
+    #     .value reads/writes on either name see the identical Hyperopt-
+    #     managed value). A NEW piece of code written against the old
+    #     name, using .value explicitly, works correctly.
+    #   - self.OLD_NAME used WITHOUT .value — the pre-Part-9.4 style,
+    #     since these were plain floats/ints back then and .value wasn't
+    #     needed — does NOT work and was never going to: DecimalParameter/
+    #     IntParameter (freqtrade.strategy.parameters.BaseParameter and its
+    #     subclasses) define no __mul__/__add__/__lt__/__float__/__index__
+    #     or any other numeric dunder method (confirmed directly against
+    #     freqtrade's own parameters.py source, not assumed) — so
+    #     `self.OLD_NAME * x` or `self.OLD_NAME >= y` raises TypeError
+    #     regardless of whether OLD_NAME is an alias or the primary name.
+    #     No alias can restore bare-name arithmetic on a Parameter object;
+    #     only .value ever worked, before or after this block existed.
+    #     This is a correction to this file's own prior claim, not a new
+    #     limitation introduced here.
+    #
+    # HOW THIS INTERACTS WITH FREQTRADE'S OWN HYPEROPT MACHINERY — also
+    # confirmed directly against freqtrade's source (strategy/hyper.py,
+    # detect_all_parameters()), not assumed: Freqtrade enumerates
+    # hyperoptable parameters by calling dir(strategy) and keeping every
+    # attribute whose class subclasses BaseParameter, storing each one
+    # under result[space][attr_name] and setting attr.name = attr_name as
+    # it goes. Because dir() will find BOTH names below (they're genuinely
+    # two separate class attributes pointing at one shared object), both
+    # the OLD and NEW name will appear as separate entries in Freqtrade's
+    # per-space parameter dictionary — e.g. both "BASE_SL_TRENDING_PTS" and
+    # "base_sl_trending_pts" will be listed. This is NOT a duplicated
+    # search dimension (there is exactly one underlying DecimalParameter
+    # instance being optimized; setting its .value through either name
+    # changes what BOTH names report, since they are the same object) —
+    # it is a purely cosmetic double-listing in Hyperopt's own parameter
+    # summary/results-JSON output. Whichever name dir() happens to
+    # enumerate last will "win" the object's own .name attribute for
+    # logging purposes; which one that is is a CPython dir()-ordering
+    # detail (alphabetical, in practice) and is not guaranteed by
+    # anything this file controls. This cosmetic double-listing is judged
+    # an acceptable, disclosed trade-off for genuine AttributeError safety
+    # on old references — the alternative (no alias at all) is a hard
+    # crash for any such reference, which is worse.
+    #
+    # THE NEW (lowercase) NAME IS CANONICAL. All new code — including
+    # every call site in this file — should use the lowercase name. The
+    # uppercase names exist ONLY for old-reference compatibility.
+    # =========================================================================
+    ADX_TRENDING_THRESHOLD = adx_trending_threshold
+    ADX_RANGING_THRESHOLD = adx_ranging_threshold
+    DI_GAP_CONFIDENT_THRESHOLD = di_gap_confident_threshold
+    HIGH_TIER_ADX_MARGIN = high_tier_adx_margin
+    HIGH_TIER_DI_MARGIN = high_tier_di_margin
+    HIGH_TIER_BREAKOUT_PTS = high_tier_breakout_pts
+    MIN_ENTRY_BREAKOUT_PTS = min_entry_breakout_pts
+    SMC_SWING_LENGTH = smc_swing_length
+    SMC_STRUCTURE_LOOKBACK_BARS = smc_structure_lookback_bars
+    SMC_FVG_LOOKBACK_BARS = smc_fvg_lookback_bars
+    SMC_OB_MIN_PERCENTAGE = smc_ob_min_percentage
+    SMC_MIN_CONFIRMATIONS = smc_min_confirmations
+    BASE_SL_TRENDING_PTS = base_sl_trending_pts
+    BASE_SL_RANGING_PTS = base_sl_ranging_pts
+    RANGING_BREAKEVEN_TRIGGER_PTS = ranging_breakeven_trigger_pts
+    RANGING_TIMEBOMB_SECONDS = ranging_timebomb_seconds
+    TRENDING_BREAKEVEN_TRIGGER_PTS = trending_breakeven_trigger_pts
+    TRENDING_TIMEBOMB_SECONDS = trending_timebomb_seconds
+    TIMEBOMB_PROFIT_EXEMPT_PTS = timebomb_profit_exempt_pts
+    CHECKPOINT_DELAY_SECONDS = checkpoint_delay_seconds
+    IV_CRUSH_TRIGGER_PTS = iv_crush_trigger_pts
+    IV_CRUSH_TIGHTEN_MULTIPLIER = iv_crush_tighten_multiplier
+    TRAILING_RANGING_PTS = trailing_ranging_pts
+    TRAILING_TRENDING_PTS = trailing_trending_pts
 
     # --- Phase 5: Kill-Switch --------------------------------------------
     KILL_SWITCH_CONSECUTIVE_SL = 3
@@ -1755,12 +2074,14 @@ class v12_Strategy(IStrategy):
         ).abs()
 
         # --- Phase 0: Regime classification -----------------------------
-        # >25 Trending, <20 Ranging, 20-25 Transition Zone (skip).
+        # >25 Trending, <20 Ranging, 20-25 Transition Zone (skip). PART 9.4:
+        # thresholds now read via .value from the Hyperopt DecimalParameters
+        # declared above (was a plain ">"/"<" against a hardcoded float).
         dataframe["regime"] = np.where(
-            dataframe["adx_avg3"] > self.ADX_TRENDING_THRESHOLD,
+            dataframe["adx_avg3"] > self.adx_trending_threshold.value,
             "trending",
             np.where(
-                dataframe["adx_avg3"] < self.ADX_RANGING_THRESHOLD,
+                dataframe["adx_avg3"] < self.adx_ranging_threshold.value,
                 "ranging",
                 "transition",
             ),
@@ -1768,8 +2089,9 @@ class v12_Strategy(IStrategy):
 
         # --- Phase 0.3: Direction Confidence Zone -----------------------
         # |+DI - -DI| (3-reading avg) >= 4 -> Confident, else Ambiguous/skip.
+        # PART 9.4: .value read from the Hyperopt DecimalParameter above.
         dataframe["direction_confident"] = (
-            dataframe["di_gap_avg3"] >= self.DI_GAP_CONFIDENT_THRESHOLD
+            dataframe["di_gap_avg3"] >= self.di_gap_confident_threshold.value
         )
         dataframe["direction_bias"] = np.where(
             dataframe["plus_di_avg3"] > dataframe["minus_di_avg3"], "long", "short"
@@ -1887,7 +2209,11 @@ class v12_Strategy(IStrategy):
         _smc_input = dataframe[["open", "high", "low", "close", "volume"]].reset_index(
             drop=True
         )
-        _smc_swing = swing_highs_lows(_smc_input, swing_length=self.SMC_SWING_LENGTH)
+        # PART 9.4: .value read from the Hyperopt IntParameter above —
+        # swing_length= needs a genuine int, which .value provides (an
+        # IntParameter behaves like its numeric value in arithmetic but
+        # this kwarg needs the real int, same as the range() call below).
+        _smc_swing = swing_highs_lows(_smc_input, swing_length=self.smc_swing_length.value)
         _smc_bos = bos_choch(_smc_input, _smc_swing, close_break=True)
         _smc_ob = ob(_smc_input, _smc_swing, close_mitigation=False)
         _smc_fvg = fvg(_smc_input, join_consecutive=False)
@@ -1914,7 +2240,7 @@ class v12_Strategy(IStrategy):
         dataframe["smc_fvg_mitigated_index"] = _smc_fvg["MitigatedIndex"].values
 
         # --- FVG confirmation: unmitigated, same-direction gap in the last
-        # SMC_FVG_LOOKBACK_BARS candles BEHIND the breakout candle. Never
+        # smc_fvg_lookback_bars candles BEHIND the breakout candle. Never
         # checks the breakout candle's own (unshifted) FVG value — that
         # value needs one candle of forward data that cannot exist yet at
         # decision time (Gap #7). MITIGATEDINDEX CORRECTION (see the SMC
@@ -1922,7 +2248,9 @@ class v12_Strategy(IStrategy):
         # `== 0`, not `.isna()`.
         smc_fvg_confirms_long = pd.Series(False, index=dataframe.index)
         smc_fvg_confirms_short = pd.Series(False, index=dataframe.index)
-        for _smc_k in range(1, self.SMC_FVG_LOOKBACK_BARS + 1):
+        # PART 9.4: .value read from the Hyperopt IntParameter above —
+        # range() requires a genuine int, not the IntParameter wrapper.
+        for _smc_k in range(1, self.smc_fvg_lookback_bars.value + 1):
             _fvg_shift = dataframe["smc_fvg"].shift(_smc_k)
             _mit_shift = dataframe["smc_fvg_mitigated_index"].shift(_smc_k)
             smc_fvg_confirms_long = smc_fvg_confirms_long | (
@@ -1945,17 +2273,20 @@ class v12_Strategy(IStrategy):
         # truthy) — the same class of NaN-poisoning AUDIT FIX A already
         # guards against elsewhere in this file, just NaN-to-True instead
         # of NaN-to-always-False.
+        # PART 9.4: .rolling() needs a genuine int window; .value is read
+        # from the Hyperopt IntParameter declared above at every one of
+        # the four call sites in this SMC block.
         dataframe["smc_bos_confirms_long"] = (
             (dataframe["smc_bos"] == 1)
             .astype(int)
-            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .rolling(self.smc_structure_lookback_bars.value, min_periods=1)
             .max()
             .astype(bool)
         )
         dataframe["smc_bos_confirms_short"] = (
             (dataframe["smc_bos"] == -1)
             .astype(int)
-            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .rolling(self.smc_structure_lookback_bars.value, min_periods=1)
             .max()
             .astype(bool)
         )
@@ -1964,23 +2295,25 @@ class v12_Strategy(IStrategy):
         # ob() re-derives this from scratch on every populate_indicators
         # call, so an already-invalidated block simply won't show as
         # 1/-1 anymore) order block, above the Percentage floor, present
-        # anywhere in the last SMC_STRUCTURE_LOOKBACK_BARS candles. Same
+        # anywhere in the last smc_structure_lookback_bars candles. Same
         # corroborating-structure caveat and NaN-guard as BOS above.
+        # PART 9.4: .value read from the Hyperopt DecimalParameter/
+        # IntParameter declared above at all four sites below.
         _smc_ob_bull_strong = (dataframe["smc_ob"] == 1) & (
-            dataframe["smc_ob_percentage"] >= self.SMC_OB_MIN_PERCENTAGE
+            dataframe["smc_ob_percentage"] >= self.smc_ob_min_percentage.value
         )
         _smc_ob_bear_strong = (dataframe["smc_ob"] == -1) & (
-            dataframe["smc_ob_percentage"] >= self.SMC_OB_MIN_PERCENTAGE
+            dataframe["smc_ob_percentage"] >= self.smc_ob_min_percentage.value
         )
         dataframe["smc_ob_confirms_long"] = (
             _smc_ob_bull_strong.astype(int)
-            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .rolling(self.smc_structure_lookback_bars.value, min_periods=1)
             .max()
             .astype(bool)
         )
         dataframe["smc_ob_confirms_short"] = (
             _smc_ob_bear_strong.astype(int)
-            .rolling(self.SMC_STRUCTURE_LOOKBACK_BARS, min_periods=1)
+            .rolling(self.smc_structure_lookback_bars.value, min_periods=1)
             .max()
             .astype(bool)
         )
@@ -2001,11 +2334,12 @@ class v12_Strategy(IStrategy):
             + dataframe["smc_ob_confirms_short"].astype(int)
         )
         if self.SMC_GATE_ENABLED:
+            # PART 9.4: .value read from the Hyperopt IntParameter above.
             dataframe["smc_gate_passed_long"] = (
-                dataframe["smc_confirmation_count_long"] >= self.SMC_MIN_CONFIRMATIONS
+                dataframe["smc_confirmation_count_long"] >= self.smc_min_confirmations.value
             )
             dataframe["smc_gate_passed_short"] = (
-                dataframe["smc_confirmation_count_short"] >= self.SMC_MIN_CONFIRMATIONS
+                dataframe["smc_confirmation_count_short"] >= self.smc_min_confirmations.value
             )
         else:
             # SMC_GATE_ENABLED=False: the diagnostic columns above still
@@ -2035,6 +2369,16 @@ class v12_Strategy(IStrategy):
         dataframe["enter_long"] = 0
         dataframe["enter_short"] = 0
         dataframe["confirmation_tier"] = "none"
+        # PART 9.3 (2026-09-08): explicit default, matching the existing
+        # enter_long/enter_short/confirmation_tier initialization pattern
+        # immediately above — Freqtrade reports "OTHER" for any row where
+        # enter_tag is left unset, so this default is never actually seen
+        # on a real trade (every row that reaches enter_long=1/enter_short=1
+        # is also covered by one of the four .loc assignments below), but
+        # initializing it explicitly here keeps the column's dtype/default
+        # consistent with the rest of this method rather than leaving it
+        # implicitly NaN until the first .loc write.
+        dataframe["enter_tag"] = "none"
 
         # --- Phase 1 direction filter (applies to both regimes) --------
         # +DI > -DI, gap >= 4 -> Buy. -DI > +DI, gap >= 4 -> Sell.
@@ -2090,17 +2434,19 @@ class v12_Strategy(IStrategy):
         # Trending breakouts only (see the "2026-09-06 FEATURE ADDITION"
         # header block), and this file has never defined a Ranging-side
         # SMC gate.
+        # PART 9.4: .value read from the Hyperopt DecimalParameter above
+        # (was a plain 0.15 constant).
         trend_long_trigger = (
             trending
             & long_direction_ok
-            & (dataframe["breakout_magnitude_long"] >= self.MIN_ENTRY_BREAKOUT_PTS)
+            & (dataframe["breakout_magnitude_long"] >= self.min_entry_breakout_pts.value)
             & dataframe["tick_consistency_long"]
             & dataframe["smc_gate_passed_long"]
         )
         trend_short_trigger = (
             trending
             & short_direction_ok
-            & (dataframe["breakout_magnitude_short"] >= self.MIN_ENTRY_BREAKOUT_PTS)
+            & (dataframe["breakout_magnitude_short"] >= self.min_entry_breakout_pts.value)
             & dataframe["tick_consistency_short"]
             & dataframe["smc_gate_passed_short"]
         )
@@ -2132,6 +2478,37 @@ class v12_Strategy(IStrategy):
         dataframe.loc[trend_long_trigger | ranging_long_trigger, "enter_long"] = 1
         dataframe.loc[trend_short_trigger | ranging_short_trigger, "enter_short"] = 1
 
+        # ------------------------------------------------------------------
+        # PART 9.3 (2026-09-08): enter_tag regime labeling.
+        #
+        # Before this, every trade's enter_tag defaulted to Freqtrade's own
+        # "OTHER" — the regime a trade opened under (already tracked
+        # in-memory via state["regime"], frozen in custom_stoploss) was
+        # invisible to Freqtrade's own ENTER TAG STATS / EXIT REASON STATS
+        # backtest output. This is the one-line-per-branch change the
+        # backtest report's Part 9.3 specifies: stamp enter_tag with
+        # "trending" or "ranging" at the exact candle each trigger fires,
+        # so the next backtest run's own standard output gives a
+        # regime-split breakdown with zero custom analysis needed — the
+        # concrete, smallest possible change that unblocks AUDIT FIX P's
+        # open question (whether ranging_timebomb_seconds's 60s default
+        # needs its own fix, the way trending_timebomb_seconds got one).
+        #
+        # No logic change: this only labels trades that were ALREADY going
+        # to fire per the trigger conditions above — it does not add or
+        # remove any entry, and does not affect enter_long/enter_short,
+        # confirmation_tier, or anything downstream in confirm_trade_entry.
+        # Four .loc assignments, one per trigger (trend_long, trend_short,
+        # ranging_long, ranging_short) — deliberately NOT collapsed into a
+        # single "trending & (enter_long | enter_short)" style condition,
+        # so a future 4th regime or a Trending/Ranging trigger split that
+        # stops being symmetric doesn't silently mislabel a trade.
+        # ------------------------------------------------------------------
+        dataframe.loc[trend_long_trigger, "enter_tag"] = "trending"
+        dataframe.loc[trend_short_trigger, "enter_tag"] = "trending"
+        dataframe.loc[ranging_long_trigger, "enter_tag"] = "ranging"
+        dataframe.loc[ranging_short_trigger, "enter_tag"] = "ranging"
+
         # --- Phase 1.5: first-pass tier classification (Trending only) ---
         # The blueprint's tier table is explicitly Trending-specific
         # ("Ranging-trades ke liye yeh apply nahi hoti... Ranging apna alag
@@ -2140,8 +2517,9 @@ class v12_Strategy(IStrategy):
         # SIMPLIFICATION, not a blueprint-specified rule — the blueprint
         # never defines a Ranging-side tier table, so no wait/skip gating is
         # applied to Ranging entries here. Flagged rather than invented.
-        adx_margin = dataframe["adx_avg3"] - self.ADX_TRENDING_THRESHOLD
-        di_margin = dataframe["di_gap_avg3"] - self.DI_GAP_CONFIDENT_THRESHOLD
+        # PART 9.4: .value read from the Hyperopt parameters above.
+        adx_margin = dataframe["adx_avg3"] - self.adx_trending_threshold.value
+        di_margin = dataframe["di_gap_avg3"] - self.di_gap_confident_threshold.value
         breakout_mag = np.where(
             trend_long_trigger,
             dataframe["breakout_magnitude_long"],
@@ -2154,9 +2532,9 @@ class v12_Strategy(IStrategy):
         )
 
         is_high_tier = (
-            (adx_margin >= self.HIGH_TIER_ADX_MARGIN)
-            & (di_margin >= self.HIGH_TIER_DI_MARGIN)
-            & (breakout_mag >= self.HIGH_TIER_BREAKOUT_PTS)
+            (adx_margin >= self.high_tier_adx_margin.value)
+            & (di_margin >= self.high_tier_di_margin.value)
+            & (breakout_mag >= self.high_tier_breakout_pts.value)
             & tick_clean
         )
         # Medium: margins positive (didn't fail Phase-1's own gates) but
@@ -2451,9 +2829,11 @@ class v12_Strategy(IStrategy):
         # Step B: fresh ADX-margin / DI-gap-margin. Breakout magnitude and
         # tick-consistency stay at their ORIGINAL trigger-moment values per
         # blueprint's explicit scope limitation ("inka koi fresh version
-        # nahi banaya ja raha").
-        fresh_adx_margin = candle["adx_avg3"] - self.ADX_TRENDING_THRESHOLD
-        fresh_di_margin = candle["di_gap_avg3"] - self.DI_GAP_CONFIDENT_THRESHOLD
+        # nahi banaya ja raha"). PART 9.4: .value read from the Hyperopt
+        # parameters declared on the class — same threshold Step A/the
+        # original trigger used, just re-read on fresh data at this point.
+        fresh_adx_margin = candle["adx_avg3"] - self.adx_trending_threshold.value
+        fresh_di_margin = candle["di_gap_avg3"] - self.di_gap_confident_threshold.value
         original_breakout_mag = (
             candle["breakout_magnitude_long"]
             if side == "long"
@@ -2466,11 +2846,12 @@ class v12_Strategy(IStrategy):
         )
 
         # Step C: re-apply the FULL tier table to fresh margins + frozen
-        # breakout/tick values.
+        # breakout/tick values. PART 9.4: .value read from the Hyperopt
+        # parameters above.
         if (
-            fresh_adx_margin >= self.HIGH_TIER_ADX_MARGIN
-            and fresh_di_margin >= self.HIGH_TIER_DI_MARGIN
-            and original_breakout_mag >= self.HIGH_TIER_BREAKOUT_PTS
+            fresh_adx_margin >= self.high_tier_adx_margin.value
+            and fresh_di_margin >= self.high_tier_di_margin.value
+            and original_breakout_mag >= self.high_tier_breakout_pts.value
             and original_tick_clean
         ):
             fresh_tier = "high"
@@ -2616,10 +2997,12 @@ class v12_Strategy(IStrategy):
                 # "2026-09-06 AUDIT PASS (LIVE CRASH)" header block above.
                 vol_ratio = float(candle["volatility_ratio"])
 
+            # PART 9.4: .value read from the Hyperopt DecimalParameters
+            # declared on the class (was a plain BASE_SL_*_PTS constant).
             base_sl = (
-                self.BASE_SL_TRENDING_PTS
+                self.base_sl_trending_pts.value
                 if regime == "trending"
-                else self.BASE_SL_RANGING_PTS
+                else self.base_sl_ranging_pts.value
             )
             entry_adaptive_sl_pts = base_sl * vol_ratio  # already clamped upstream
 
@@ -2660,6 +3043,101 @@ class v12_Strategy(IStrategy):
                     pair, trade.id, candle["atr"], current_rate,
                 )
 
+            # ---------------------------------------------------------------
+            # PART 9.2 (2026-09-08): freeze entry_structure_level — the
+            # exact price level that justified THIS trade's entry, per the
+            # backtest report's Part 9.2 spec. Read by custom_exit's new
+            # structure-invalidated-exit check (search "PART 9.2" in that
+            # method) to close a trade as soon as price closes back through
+            # the level that made the trade valid, ahead of the timebomb
+            # timer — a faster, structure-driven trigger layered ON TOP of
+            # the existing timer, not a replacement for it.
+            #
+            # WHICH LEVEL, AND WHY THIS EXACT ONE (matching what the
+            # trigger in populate_entry_trend actually compared against,
+            # not a re-derived approximation of it):
+            #
+            #   - TRENDING long: trend_long_trigger's own
+            #     breakout_magnitude_long is computed in populate_indicators
+            #     as (close - rolling_high_20.shift(1)) / atr — i.e. the
+            #     breakout was measured against the PRIOR candle's 20-bar
+            #     high, not this candle's own (which already includes this
+            #     candle's own high and would be a slightly different,
+            #     self-referential number). dataframe["rolling_high_20"]
+            #     .iloc[-2] on this entry candle is exactly that prior-
+            #     candle value — the same anti-lookahead level the trigger
+            #     itself fired against.
+            #   - TRENDING short: symmetric, rolling_low_20.shift(1) ->
+            #     dataframe["rolling_low_20"].iloc[-2].
+            #   - RANGING long: ranging_long_trigger compares close against
+            #     rolling_low_20 + ranging_bounce_dist on THIS SAME candle
+            #     (unshifted — only the close/comparison side of that
+            #     trigger uses .shift(1), not rolling_low_20 itself). The
+            #     level that "the bounce failed" means crossing back
+            #     through is that same unshifted extreme:
+            #     candle["rolling_low_20"] (== dataframe["rolling_low_20"]
+            #     .iloc[-1], this entry candle's own value).
+            #   - RANGING short: symmetric, candle["rolling_high_20"].
+            #
+            # Uses `regime` (already resolved above, either from state or
+            # freshly classified) and `is_long` (already resolved above)
+            # rather than re-deriving direction from trade.is_short a
+            # second time. Defensively guarded (len(dataframe) >= 2 check,
+            # explicit column-existence check, try/except) even though
+            # startup_candle_count=60 should make the >=2 case
+            # unreachable in practice — matching this file's existing
+            # "a watchdog/freeze point must not crash on an edge case it
+            # doesn't expect" standard (see AUDIT FIX Q's reasoning). A
+            # failure here does NOT abort the trade open; it leaves
+            # entry_structure_level as None, which custom_exit's new check
+            # treats as "field not available, skip the check, fall through
+            # to the existing timer logic" — additive and backward-
+            # compatible, per the report's own explicit requirement, not
+            # a hard dependency that could block a trade from opening.
+            # ---------------------------------------------------------------
+            entry_structure_level = None
+            try:
+                if regime == "trending":
+                    level_col = "rolling_high_20" if is_long else "rolling_low_20"
+                    if level_col in dataframe.columns and len(dataframe) >= 2:
+                        prior_level = dataframe[level_col].iloc[-2]
+                        if np.isfinite(prior_level):
+                            entry_structure_level = float(prior_level)
+                else:
+                    # Ranging (or "trending" fallback default for an
+                    # undetermined regime — see the regime resolution
+                    # above this branch; treated as ranging's own
+                    # unshifted-level convention only when regime is
+                    # LITERALLY "ranging", never silently assumed).
+                    level_col = "rolling_low_20" if is_long else "rolling_high_20"
+                    if level_col in dataframe.columns:
+                        current_level = candle[level_col]
+                        if np.isfinite(current_level):
+                            entry_structure_level = float(current_level)
+            except Exception:
+                # Never let this optional capture abort a trade open —
+                # same "fail loud in the log, never silently crash the
+                # bot" standard used throughout this file (see e.g. the
+                # leverage() floor guard, AUDIT FIX B/Q).
+                logger.exception(
+                    "[Part9.2-StructureLevel] %s trade#%s: failed to "
+                    "capture entry_structure_level; structure-invalidated "
+                    "exit will be skipped for this trade (falls through "
+                    "to the existing timebomb-only logic, unchanged).",
+                    pair, trade.id,
+                )
+                entry_structure_level = None
+
+            if entry_structure_level is None:
+                logger.warning(
+                    "[Part9.2-StructureLevel] %s trade#%s: "
+                    "entry_structure_level unavailable at entry (regime=%s) "
+                    "— structure-invalidated exit will be skipped for this "
+                    "trade; falls through to the existing timebomb-only "
+                    "exit logic, unchanged from before Part 9.2.",
+                    pair, trade.id, regime,
+                )
+
             state = {
                 "regime": regime,
                 "entry_adaptive_sl_pts": entry_adaptive_sl_pts,
@@ -2694,6 +3172,17 @@ class v12_Strategy(IStrategy):
                     # because that's the only price known at this instant —
                     # there is nothing side-specific to differ on here.
                 "trailing_armed": False,
+                # PART 9.2: see the long comment block immediately above
+                # this state dict for what this is and exactly which level
+                # it holds per regime/direction. Optional field — None is a
+                # valid, expected value (see the no-ops-cleanly guarantee
+                # in that comment and in custom_exit's new check), NOT
+                # added to _restore_active_sl_state's required_keys, so a
+                # trade whose persisted state predates this field restores
+                # cleanly via .get(..., None) and simply skips the new
+                # check, exactly as the report's backward-compatibility
+                # requirement specifies.
+                "entry_structure_level": entry_structure_level,
             }
             self._active_sl_state[trade.id] = state
             logger.info(
@@ -2788,16 +3277,17 @@ class v12_Strategy(IStrategy):
         # a deliberate Step-2 protective tighten for an illegitimate
         # re-tighten of a widen, and silently undo it almost every time.
         # ---------------------------------------------------------------
+        # PART 9.4: .value read from the Hyperopt IntParameter above.
         if (
             regime == "trending"
             and not state["checkpoint_done"]
-            and seconds_open >= self.CHECKPOINT_DELAY_SECONDS
+            and seconds_open >= self.checkpoint_delay_seconds.value
         ):
             # --- Step 1: Volatility-Reassessment (widen OR tighten) -----
             # AUDIT FIX H (2026-09-06): cast to native float — see the
             # "2026-09-06 AUDIT PASS (LIVE CRASH)" header block above.
             checkpoint_vol_ratio = float(candle["volatility_ratio"])
-            checkpoint_sl_pts = self.BASE_SL_TRENDING_PTS * checkpoint_vol_ratio
+            checkpoint_sl_pts = self.base_sl_trending_pts.value * checkpoint_vol_ratio
             # already clamped via the dataframe's safe-ratio + .clip() in
             # populate_indicators (see AUDIT FIX A above)
 
@@ -2873,15 +3363,17 @@ class v12_Strategy(IStrategy):
                 # CROSS-PAIR SCALE FIX (2026-09-07): adverse_move_pts is a
                 # raw price-difference (trade.open_rate - current_rate),
                 # same issue as SL/breakeven/trailing/breakout above — a
-                # fixed 20.0-point IV_CRUSH_TRIGGER_PTS threshold is
+                # fixed 20.0-point iv_crush_trigger_pts threshold is
                 # trivially crossed on some pairs and unreachable on
                 # others. Normalized by state["atr_scale"] (frozen at this
                 # trade's entry), matching the same convention used
-                # throughout custom_stoploss.
-                step2_fires = adverse_move_pts >= (self.IV_CRUSH_TRIGGER_PTS * state["atr_scale"])
+                # throughout custom_stoploss. PART 9.4: .value read from
+                # the Hyperopt DecimalParameter above.
+                step2_fires = adverse_move_pts >= (self.iv_crush_trigger_pts.value * state["atr_scale"])
 
             if step2_fires:
-                final_checkpoint_sl_pts = checkpoint_sl_pts * self.IV_CRUSH_TIGHTEN_MULTIPLIER
+                # PART 9.4: .value read from the Hyperopt DecimalParameter.
+                final_checkpoint_sl_pts = checkpoint_sl_pts * self.iv_crush_tighten_multiplier.value
             else:
                 final_checkpoint_sl_pts = checkpoint_sl_pts
 
@@ -2904,7 +3396,8 @@ class v12_Strategy(IStrategy):
             # down, so a genuine protective tighten can actually reduce the
             # delivered stop distance instead of being floored back up.
             active_sl_pts = checkpoint_sl_pts
-            step2_multiplier = self.IV_CRUSH_TIGHTEN_MULTIPLIER if step2_fires else 1.0
+            # PART 9.4: .value read from the Hyperopt DecimalParameter.
+            step2_multiplier = self.iv_crush_tighten_multiplier.value if step2_fires else 1.0
 
             # --- Component-Level Logging Requirement (v10 Gap 4 fix) -----
             # All seven fields logged separately per blueprint — deliberately
@@ -2955,7 +3448,7 @@ class v12_Strategy(IStrategy):
             # iteration after the checkpoint has already fired once.
             active_sl_pts = state["checkpoint_sl_pts"]
             step2_multiplier = (
-                self.IV_CRUSH_TIGHTEN_MULTIPLIER if state["step2_fired"] else 1.0
+                self.iv_crush_tighten_multiplier.value if state["step2_fired"] else 1.0
             )
 
         # This IS the blueprint's Active-SL concept: whichever of
@@ -3045,9 +3538,9 @@ class v12_Strategy(IStrategy):
         # above for the full reasoning.
         # ---------------------------------------------------------------
         breakeven_trigger_pts = (
-            self.RANGING_BREAKEVEN_TRIGGER_PTS
+            self.ranging_breakeven_trigger_pts.value
             if regime == "ranging"
-            else self.TRENDING_BREAKEVEN_TRIGGER_PTS
+            else self.trending_breakeven_trigger_pts.value
         ) * state["entry_volatility_ratio"] * state["atr_scale"]  # frozen entry multiplier, per blueprint
 
         profit_pts = (
@@ -3069,9 +3562,9 @@ class v12_Strategy(IStrategy):
         # above, same reasoning.
         # ---------------------------------------------------------------
         trailing_distance_pts = (
-            self.TRAILING_RANGING_PTS
+            self.trailing_ranging_pts.value
             if regime == "ranging"
-            else self.TRAILING_TRENDING_PTS
+            else self.trailing_trending_pts.value
         ) * state["entry_volatility_ratio"] * state["atr_scale"]
 
         if is_long:
@@ -3258,6 +3751,103 @@ class v12_Strategy(IStrategy):
         state = self._active_sl_state.get(trade.id, {})
         regime = state.get("regime", "trending")
         seconds_open = (current_time - trade.open_date_utc).total_seconds()
+        is_long = not trade.is_short
+
+        # ---------------------------------------------------------------
+        # PART 9.2 (2026-09-08) — STRUCTURE-INVALIDATION EXIT.
+        #
+        # Evaluated FIRST, ahead of the timebomb block below, per the
+        # backtest report's Part 9.2 spec: "Fires BEFORE the timebomb
+        # check, not instead of it — this is a faster, structure-driven
+        # trigger that can close a trade well before the timer would, and
+        # the timer remains as the final backstop." Reads the fresh
+        # candle every call via self.dp.get_analyzed_dataframe — the
+        # identical access pattern custom_stoploss already uses (see
+        # lines ~2582/2809) — not a stale snapshot from entry time; only
+        # entry_level itself (the price level) is frozen from entry, the
+        # candle it's compared against is always current.
+        #
+        # entry_structure_level is frozen once, in custom_stoploss's
+        # first-call branch (search "PART 9.2" there for exactly which
+        # rolling_high_20/rolling_low_20 value gets captured per
+        # regime/direction, and why that specific one matches what the
+        # entry trigger in populate_entry_trend actually compared
+        # against). Here it is only ever read, never computed or
+        # re-derived — this method has no business re-deriving an entry-
+        # time value from scratch a second time.
+        #
+        # BACKWARD COMPATIBILITY: state.get("entry_structure_level") — a
+        # plain dict .get(), not state["entry_structure_level"] — because
+        # this key is deliberately NOT in _restore_active_sl_state's
+        # required_keys (see that method and the comment on this field in
+        # custom_stoploss's state dict). A trade opened before this field
+        # existed, or one where the capture failed and left it None
+        # (see custom_stoploss's try/except around the capture), simply
+        # gets None back here and falls through to the unchanged
+        # timebomb-only logic below — exactly the report's own explicit
+        # "additive and backward-compatible... falls through to the
+        # existing timer logic unchanged" requirement, not a hard
+        # dependency that could break an in-flight trade or crash this
+        # method.
+        #
+        # Kept as a DISTINCT exit reason ("structure_invalidated_exit",
+        # never "phase3_timebomb_exit") so the next backtest's exit-
+        # reason breakdown can tell the two causes apart, per the
+        # report's explicit instruction. Deliberately does not touch
+        # custom_stoploss, the watchdog (Fix N/Q), the kill-switch
+        # (Fix D/M — confirmed above: "stop_loss" substring match does
+        # not accidentally catch this new reason string), or the SMC
+        # gate (Fix C/O) — none of those are in scope for this check,
+        # matching the report's own "nothing else needs to change to add
+        # this" statement.
+        # ---------------------------------------------------------------
+        entry_level = state.get("entry_structure_level")
+        if entry_level is not None:
+            try:
+                struct_dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            except Exception:
+                # Never let a data-provider hiccup crash the exit path —
+                # same "fail loud, never silently crash the bot" standard
+                # as the rest of this file (AUDIT FIX B/Q). Falls through
+                # to the timebomb logic below exactly as a missing
+                # entry_level would.
+                logger.exception(
+                    "[Part9.2-StructureExit] %s trade#%s: failed to fetch "
+                    "analyzed dataframe for structure-invalidation check; "
+                    "skipping this check for this call, falling through "
+                    "to timebomb logic unchanged.",
+                    pair, trade.id,
+                )
+                struct_dataframe = None
+
+            if struct_dataframe is not None and not struct_dataframe.empty:
+                struct_candle = struct_dataframe.iloc[-1]
+                struct_close = struct_candle["close"]
+                if np.isfinite(struct_close):
+                    if is_long and struct_close < entry_level:
+                        logger.info(
+                            "[Part9.2-StructureExit] %s trade#%s: LONG "
+                            "structure invalidated — close=%.8f fell "
+                            "below frozen entry_structure_level=%.8f "
+                            "(regime=%s, seconds_open=%.1fs). Exiting "
+                            "ahead of the %s timebomb timer.",
+                            pair, trade.id, struct_close, entry_level,
+                            regime, seconds_open,
+                            "trending" if regime != "ranging" else "ranging",
+                        )
+                        return "structure_invalidated_exit"
+                    if (not is_long) and struct_close > entry_level:
+                        logger.info(
+                            "[Part9.2-StructureExit] %s trade#%s: SHORT "
+                            "structure invalidated — close=%.8f rose "
+                            "above frozen entry_structure_level=%.8f "
+                            "(regime=%s, seconds_open=%.1fs). Exiting "
+                            "ahead of the %s timebomb timer.",
+                            pair, trade.id, struct_close, entry_level,
+                            regime, seconds_open,
+                            "trending" if regime != "ranging" else "ranging",
+                        )
+                        return "structure_invalidated_exit"
 
         # AUDIT FIX P (2026-09-08) — FLAGGED, NOT CHANGED. Read this before
         # assuming RANGING_TIMEBOMB_SECONDS=60 is either fine or needs the
@@ -3319,9 +3909,9 @@ class v12_Strategy(IStrategy):
         # picked by analogy to the trending fix.
         if regime == "ranging":
             vol_ratio = state.get("entry_volatility_ratio", 1.0)
-            timebomb_seconds = self.RANGING_TIMEBOMB_SECONDS * vol_ratio
+            timebomb_seconds = self.ranging_timebomb_seconds.value * vol_ratio
         else:
-            timebomb_seconds = self.TRENDING_TIMEBOMB_SECONDS  # NOT adaptive, per blueprint
+            timebomb_seconds = self.trending_timebomb_seconds.value  # NOT adaptive, per blueprint
 
         if seconds_open >= timebomb_seconds:
             # AUDIT FIX J: compute profit in atr_scale-adjusted points, the
@@ -3331,7 +3921,8 @@ class v12_Strategy(IStrategy):
             # breakout_magnitude_*/custom_stoploss above for the same
             # convention applied elsewhere in this file).
             atr_scale = state.get("atr_scale", 1.0)
-            is_long = not trade.is_short
+            # is_long already resolved above (PART 9.2 block) — not
+            # re-derived here to avoid a pointless duplicate assignment.
             if atr_scale and atr_scale > 0:
                 profit_pts = (
                     (current_rate - trade.open_rate)
@@ -3348,14 +3939,14 @@ class v12_Strategy(IStrategy):
                 # falling back to the pre-fix, always-fire behavior).
                 profit_pts = 0.0
 
-            if profit_pts >= self.TIMEBOMB_PROFIT_EXEMPT_PTS:
+            if profit_pts >= self.timebomb_profit_exempt_pts.value:
                 logger.info(
                     "[Phase3-TimeBomb] %s trade#%s: time-bomb threshold "
                     "reached at %.1fs but trade is +%.2fpt (>= exempt "
                     "threshold %.2fpt) — skipping forced exit, leaving "
                     "Phase 4 trailing-stop in control.",
                     pair, trade.id, seconds_open, profit_pts,
-                    self.TIMEBOMB_PROFIT_EXEMPT_PTS,
+                    self.timebomb_profit_exempt_pts.value,
                 )
                 return None
 
@@ -3364,7 +3955,7 @@ class v12_Strategy(IStrategy):
                 "(threshold=%.1fs, regime=%s, profit=%.2fpt, below exempt "
                 "threshold %.2fpt).",
                 pair, trade.id, seconds_open, timebomb_seconds, regime,
-                profit_pts, self.TIMEBOMB_PROFIT_EXEMPT_PTS,
+                profit_pts, self.timebomb_profit_exempt_pts.value,
             )
             return "phase3_timebomb_exit"
 
@@ -4065,6 +4656,35 @@ class v12_Strategy(IStrategy):
             "checkpoint_done", "widest_sl_pts_seen", "atr_scale",
             "breakeven_armed", "trailing_high_water", "trailing_armed",
         }
+        # PART 9.2 (2026-09-08) — DELIBERATE DECISION, NOT AN OMISSION:
+        # "entry_structure_level" is intentionally NOT added to
+        # required_keys, even though the backtest report's Part 9.2 text
+        # contains one sentence saying this new key "needs to be added
+        # to... the restore path's required-keys check," alongside a
+        # second, separately-stated requirement in the same section that
+        # a trade whose state predates this field must fall through to
+        # the unchanged timebomb-only logic "additive and backward-
+        # compatible" / "no-ops... never crash or silently misbehave."
+        # Those two statements cannot both be honored: required_keys
+        # membership means ANY persisted state missing this key gets its
+        # ENTIRE state dict discarded here (see the `return None` a few
+        # lines below) — regime, atr_scale, widest_sl_pts_seen, every
+        # other field this trade has legitimately accumulated would be
+        # thrown away and recomputed from scratch on restore, purely
+        # because one optional, additive field is absent. That is a
+        # strictly worse outcome than the backward-compatibility promise
+        # the same report section explicitly demands, for a field whose
+        # own documented failure mode is "skip one check, change
+        # nothing else." Resolved in favor of the backward-compatibility
+        # requirement (the report's own stated priority — "additive...
+        # not a replacement that could break an in-flight trade" is the
+        # more specific and more load-bearing of the two statements):
+        # custom_exit reads this field via state.get("entry_structure_
+        # level") (plain dict access, defaults to None), never via
+        # required-keys enforcement, so a pre-upgrade or capture-failed
+        # trade restores its full state normally and just skips the new
+        # structure-invalidation check, exactly as the "no-ops cleanly"
+        # guarantee describes.
         if not required_keys.issubset(value.keys()):
             logger.warning(
                 "[Phase2.5-Persist] trade#%s: persisted custom_data is "
@@ -4172,9 +4792,12 @@ class v12_Strategy(IStrategy):
            timebomb machinery never fires at all — it can stay open
            indefinitely. Combined with max_open_trades=1, one stalled
            trade freezes the entire bot from taking any new signal.
-           This force-closes any trade left open for more than
-           2x TRENDING_TIMEBOMB_SECONDS as a hard backstop, and logs
-           loudly so it's visible this happened.
+           This force-closes any trade left open for more than 2x its
+           OWN regime's timebomb constant (trending_timebomb_seconds
+           for a trending trade, ranging_timebomb_seconds for a
+           ranging one — see AUDIT FIX N below for why this must be
+           regime-aware, not a single fixed multiple), as a hard
+           backstop, and logs loudly so it's visible this happened.
         """
         try:
             with open("/tmp/freqtrade_heartbeat", "w") as f:
@@ -4252,13 +4875,17 @@ class v12_Strategy(IStrategy):
             # already in place below, instead of crashing.
             trade_regime = trade_state.get("regime") if trade_state else None
             if trade_regime == "ranging":
-                base_timebomb_seconds = self.RANGING_TIMEBOMB_SECONDS
-                basis_label = "RANGING_TIMEBOMB_SECONDS"
+                base_timebomb_seconds = self.ranging_timebomb_seconds.value
+                basis_label = "ranging_timebomb_seconds"  # PART 9.4: renamed from
+                    # RANGING_TIMEBOMB_SECONDS; log-display label only, kept in
+                    # sync with the actual Hyperopt param name so a reader
+                    # grepping the log line finds the right class attribute.
             else:
                 # Also covers trade_regime is None (unknown/not yet
                 # restored) and "trending" — the old, safe default.
-                base_timebomb_seconds = self.TRENDING_TIMEBOMB_SECONDS
-                basis_label = "TRENDING_TIMEBOMB_SECONDS"
+                base_timebomb_seconds = self.trending_timebomb_seconds.value
+                basis_label = "trending_timebomb_seconds"  # PART 9.4: renamed,
+                    # see comment on the "ranging" branch above.
             watchdog_limit_seconds = 2 * base_timebomb_seconds
 
             age_seconds = (current_time - opened_at).total_seconds()
