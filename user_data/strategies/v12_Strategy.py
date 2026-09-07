@@ -284,6 +284,95 @@
 #      you ever flip DASHBOARD_WEBHOOK_ENABLED on — the source-level fix
 #      covers that path too.
 # =============================================================================
+# 2026-09-08 AUDIT PASS — four defects found and fixed, surfaced while
+# investigating the 2026-09-08 backtest report's near-total loss (3.92% win
+# rate, profit factor 0.02, 195/204 losing trades). Two of these (I, J) are
+# the report's own root-cause findings, now fixed in code. K and D are
+# separate defects found during a full end-to-end re-read of every method in
+# this file, unrelated to the report's own analysis:
+#
+#   I. Entry breakout-magnitude threshold had no effective floor. See the
+#      backtest report's "Root cause #3" and this fix's own comment at
+#      trend_long_trigger/trend_short_trigger in populate_entry_trend for
+#      the full trace. FIXED by requiring
+#      breakout_magnitude_{long,short} >= MIN_ENTRY_BREAKOUT_PTS (new
+#      constant, 0.15x ATR) instead of merely > 0.
+#
+#   J. custom_exit()'s timebomb fired on elapsed time alone; current_profit
+#      was accepted as a parameter and never read. See the backtest
+#      report's "Root causes #1-#2" and this fix's own comment block
+#      inside custom_exit for the full trace. FIXED by exempting a trade
+#      from the timebomb once it has cleared TIMEBOMB_PROFIT_EXEMPT_PTS
+#      (new constant, 2.0 ATR-scaled points) of genuine profit, handing
+#      control to Phase 4's already-running trailing-stop logic instead.
+#      NOTE: this fix ALONE does not close Root Cause #2 for trades that
+#      never reach that profit exemption — see fix L below, added after
+#      this was correctly pointed out.
+#
+#   K. THE SMC STRUCTURAL CONFIRMATION GATE (the whole "2026-09-06 FEATURE
+#      ADDITION" described earlier in this header) computed its pass/fail
+#      columns (smc_gate_passed_long/short) every candle in
+#      populate_indicators, but NO entry-path condition anywhere in this
+#      file ever read them — confirmed by searching every method for
+#      "smc_gate_passed". SMC_GATE_ENABLED=True (the default) therefore had
+#      ZERO effect on any backtest or live run to date: FVG/BOS/OB
+#      confirmation was computed, logged nowhere, and silently discarded
+#      every single candle. This means the 2026-09-08 backtest report's
+#      results (and every prior run) reflect the tier-gate-only
+#      configuration, NOT tier-gate+SMC-gate, regardless of what
+#      SMC_GATE_ENABLED was set to — the two were never actually
+#      distinguishable in practice, contrary to that constant's own stated
+#      purpose ("so you can A/B test... with and without it"). FIXED by
+#      ANDing smc_gate_passed_long/short into trend_long_trigger/
+#      trend_short_trigger in populate_entry_trend, exactly where the
+#      original 2026-09-06 header block says the gate belongs (stacked on
+#      top of the Trending tier gate, Ranging entries unaffected).
+#      SMC_GATE_ENABLED=False continues to no-op cleanly (smc_gate_passed_*
+#      is hardcoded True in that branch), so this fix changes behavior only
+#      when SMC_GATE_ENABLED=True — which is this file's own default and
+#      has been since 2026-09-06.
+#
+#   D. _rebuild_kill_switch_from_trade_history (the restart-recovery path
+#      for Phase 5's kill-switch, added 2026-09-07) matched only
+#      "stop_loss" in a closed trade's exit_reason when reconstructing the
+#      24h consecutive-severe-loss streak after a restart — but
+#      confirm_trade_exit's LIVE-tracking check (AUDIT FIX G, 2026-09-06)
+#      already also matches "liquidation", on the reasoning that a
+#      margin-liquidation exit is at least as severe a signal as a normal
+#      stop-loss hit. The two methods exist purely to count the same thing
+#      and had drifted out of sync: a restart occurring after a run of
+#      liquidation exits could silently rebuild a LOWER streak count than
+#      live-tracking had already established, potentially leaving a pair
+#      un-flagged that should have been blocked from new entries. FIXED by
+#      giving the rebuild method the identical exit-reason match
+#      confirm_trade_exit already uses — see that method's own comment
+#      block for the full trace.
+#
+#   L. TRENDING_TIMEBOMB_SECONDS (105s) vs the entry signal's own 20-minute
+#      (1200s) rolling-high/low lookback (Root Cause #2, backtest report
+#      Part 3) was ONLY partially addressed by fix J above. J exempts a
+#      trade from the timebomb once it clears +2.0pt profit — but a trade
+#      sitting below that exemption (most trades, per the report's own
+#      p-value finding that this entry shows no demonstrated edge over
+#      this time horizon) was still being force-closed at the OLD 105s
+#      mark, unchanged. This was correctly flagged as leaving the actual
+#      mismatch alive: giving a 20-minute-structure signal only ~1/11th of
+#      that time to play out, regardless of outcome, for every trade that
+#      doesn't get lucky enough to move 2pt+ fast. FIXED by raising
+#      TRENDING_TIMEBOMB_SECONDS itself from 105 to 1200 — the report's own
+#      "closer in scale to the entry signal's own 20-minute lookback
+#      window" framing, i.e. the "larger fix" option from that report's
+#      Part 4 item 2, applied on top of (not instead of) fix J. See that
+#      constant's own definition, and custom_exit's header comment, for
+#      the full derivation and the knock-on effects on
+#      CHECKPOINT_DELAY_SECONDS's relative timing and the watchdog's
+#      auto-scaled 2x backstop.
+#
+#      NONE of I/J/K/D/L have been re-backtested yet as of this writing.
+#      See the companion v12_Strategy_Backtest_Analysis.md report's Part 5
+#      for what changed, what didn't, and why a code fix here is not yet a
+#      confirmed outcome fix.
+# =============================================================================
 
 import json
 import logging
@@ -1050,6 +1139,25 @@ class v12_Strategy(IStrategy):
                                   # See FIDELITY GAP #1: this is iterations of
                                   # the bot loop, not ticks.
 
+    # AUDIT FIX I (2026-09-08): entry-trigger floor. See the full trace at
+    # this constant's point of use in populate_entry_trend
+    # (trend_long_trigger/trend_short_trigger) for why this exists — in
+    # short, breakout_magnitude_{long,short} > 0 alone let ANY positive
+    # clearance over the prior 20-candle high/low pass, no matter how small
+    # relative to the pair's own ATR. HIGH_TIER_BREAKOUT_PTS (0.5x ATR)
+    # already existed but was only ever applied AFTER trigger, deciding
+    # immediate-vs-wait-and-reverify timing, never entry eligibility itself.
+    # MIN_ENTRY_BREAKOUT_PTS reuses that same ATR-unit convention (see the
+    # "CROSS-PAIR SCALE FIX" comment on breakout_magnitude_* above) but at a
+    # deliberately lower bar than the High-tier threshold: this gates
+    # whether a trade is considered AT ALL, so it should stop noise-level
+    # breakouts (a few thousandths of an ATR) without also silently
+    # reproducing HIGH_TIER_BREAKOUT_PTS as a second, redundant ceiling that
+    # would leave the Medium tier with nothing left to classify. Untested,
+    # same as every other threshold in this file — tune empirically per
+    # item 3 of the backtest report before trusting this value specifically.
+    MIN_ENTRY_BREAKOUT_PTS = 0.15
+
     # --- Phase 1.5 (SMC Extension): Structural Confirmation Gate --------
     # See "2026-09-06 FEATURE ADDITION" in the file header and FIDELITY
     # GAP #7 for what this does and does NOT guarantee. Every value below
@@ -1118,8 +1226,115 @@ class v12_Strategy(IStrategy):
     RANGING_BREAKEVEN_TRIGGER_PTS = 2.0
     RANGING_TIMEBOMB_SECONDS = 60  # adaptive, scaled by volatility ratio
     TRENDING_BREAKEVEN_TRIGGER_PTS = 4.5  # blueprint gives 4-5pt; midpoint
-    TRENDING_TIMEBOMB_SECONDS = 105  # blueprint gives 90-120s; midpoint,
-                                      # NOT adaptive (per blueprint text)
+
+    # AUDIT FIX L (2026-09-08): TRENDING_TIMEBOMB_SECONDS raised from 105
+    # to 1200 (20 minutes). This is the "larger fix" from the 2026-09-08
+    # backtest report's Part 4 item 2, implemented after AUDIT FIX J's
+    # "minimal fix" (TIMEBOMB_PROFIT_EXEMPT_PTS, below) was correctly
+    # pointed out as still leaving Root Cause #2 alive: AUDIT FIX J only
+    # exempts a trade that has ALREADY reached +2.0pt profit before the
+    # timer expires — a trade sitting at +0.5pt, -0.5pt, or anywhere else
+    # below that exemption threshold was still being force-closed at the
+    # OLD 105-second mark regardless of outcome, which is the exact
+    # mechanism Root Cause #2 describes: giving a 20-minute entry signal
+    # (the rolling_low_20/rolling_high_20 breakout, 20 candles on this
+    # 1-minute timeframe = 1200 seconds of price structure) only 105
+    # seconds — roughly 1/11th of that — to play out before being closed
+    # regardless of direction. AUDIT FIX J alone reduced HOW OFTEN the
+    # mismatch mattered (trades that got lucky and moved 2pt+ fast were
+    # spared) without correcting the mismatch ITSELF for every other
+    # trade, which is most of them by construction (per the report's own
+    # p-value finding, the entry has no demonstrated edge over this time
+    # horizon, so most trades were never going to clear +2.0pt inside 105
+    # seconds in the first place).
+    #
+    # FIXED by raising the timer itself to 1200s — the report's own
+    # explicit "closer in scale to the entry signal's own 20-minute
+    # lookback window" framing — rather than only patching around it with
+    # a profit exemption. This is a genuine, deliberate character change
+    # to the strategy's trade lifecycle, not a minor tuning tweak, and it
+    # has real knock-on consequences that were NOT re-derived alongside it
+    # (flagged here rather than silently assumed fine, per this file's own
+    # "flag, don't invent" standard):
+    #
+    #   - CHECKPOINT_DELAY_SECONDS (60s, below) now fires at roughly 1/20th
+    #     of the way through a trending trade's new maximum lifetime
+    #     instead of roughly 57% of the way through it (60/105 under the
+    #     old timer). The Phase 3.5 mid-trade checkpoint (volatility
+    #     reassessment + IV-crush override) will now typically fire much
+    #     earlier in a trade's life relative to how long that trade can
+    #     now stay open — it is still a real, working checkpoint, just at
+    #     a different relative position in the trade's lifecycle than the
+    #     blueprint's original 60s-into-a-~105s-trade design implied.
+    #   - TRENDING_BREAKEVEN_TRIGGER_PTS/TRAILING_TRENDING_PTS above are
+    #     UNCHANGED — they still arm at the same ATR-scaled profit
+    #     distances as before. What changes is that a trade now has up to
+    #     1200s (instead of 105s) to actually reach those distances before
+    #     the timebomb would otherwise force it shut, which is the whole
+    #     point of this fix, but it does mean a trade can now sit open,
+    #     unprofitable, for far longer than the old 105s ceiling ever
+    #     allowed before either the stop-loss or this new 1200s timebomb
+    #     ends it — a materially different risk/time profile than the
+    #     original design, worth knowing going in.
+    #   - The watchdog hard-backstop in bot_loop_start
+    #     (watchdog_limit_seconds = 2 * TRENDING_TIMEBOMB_SECONDS) scales
+    #     automatically with this constant (it reads it, not a hardcoded
+    #     number), so it now force-closes stuck trades at 2400s instead of
+    #     210s. This is still correct in spirit (a stuck-trade backstop
+    #     should always sit above the normal timebomb ceiling, whatever
+    #     that ceiling currently is) but means a genuinely stalled trade
+    #     can now stay open up to 40 minutes before the watchdog acts,
+    #     versus 3.5 minutes before. Not changed independently, since
+    #     tying it to this constant (rather than a separate fixed number)
+    #     is what keeps it correct-by-construction as this constant is
+    #     tuned — see that assignment's own comment for the full watchdog
+    #     rationale.
+    #
+    # 1200 is a starting point derived directly from the report's own
+    # framing (matching the entry signal's lookback window), NOT an
+    # empirically-tuned number — same "untested, needs re-test discipline"
+    # status as every other threshold in this file. It has NOT been
+    # backtested. If 1200s turns out to be too long in practice (e.g.
+    # trades sit open through large adverse excursions that a shorter
+    # timer would have cut off sooner), the report's original "midpoint
+    # between two extremes" methodology can be reapplied between the old
+    # 105s and this new 1200s ceiling.
+    TRENDING_TIMEBOMB_SECONDS = 1200  # was 105 (blueprint's 90-120s
+                                      # midpoint) before AUDIT FIX L; see
+                                      # that fix's comment block above for
+                                      # the full derivation and tradeoffs.
+                                      # Still NOT adaptive (per blueprint
+                                      # text) — this raises the fixed
+                                      # ceiling itself, it does not make it
+                                      # volatility-scaled.
+
+    # AUDIT FIX J (2026-09-08): profit-aware timebomb floor. See custom_exit
+    # below for the full trace. current_profit was accepted as a parameter
+    # but never read in that method's body — the timebomb fired purely on
+    # elapsed time regardless of whether the trade was up or down, which the
+    # 2026-09-08 backtest report identified as the direct cause of 195/204
+    # losing trades (a fixed 105s exit force-closing trades built on a
+    # 20-minute entry signal before that signal had time to play out). This
+    # constant was originally implemented as the "minimal fix" from that
+    # report's Part 4 item 2, standing alone — AUDIT FIX L above (raising
+    # TRENDING_TIMEBOMB_SECONDS itself to 1200s) is the report's "larger
+    # fix", added afterward once it was pointed out that the minimal fix
+    # alone still left every trade below this exemption threshold subject
+    # to the old, too-short 105s ceiling. The two fixes are complementary,
+    # not redundant, and both are kept: once a trade clears this many
+    # ATR-scaled points of profit, the timebomb no longer fires
+    # unconditionally EVEN BEFORE the (now much longer) 1200s ceiling is
+    # reached, and Phase 4's already-armed trailing-stop logic
+    # (custom_stoploss, TRAILING_*_PTS) is left to manage the exit instead
+    # of force-closing a trade that has already moved the right way.
+    # Deliberately set low (not equal to the trailing-arm distance itself)
+    # so this only exempts a trade that is genuinely showing SOME real,
+    # ATR-scaled edge over the entry noise floor (MIN_ENTRY_BREAKOUT_PTS
+    # above), not one that has merely ticked fractionally positive. A
+    # trade below this profit level, or at a loss, is still time-bombed —
+    # just now at 1200s instead of 105s, per AUDIT FIX L. Untested, same
+    # as every other threshold in this file.
+    TIMEBOMB_PROFIT_EXEMPT_PTS = 2.0
 
     # --- Phase 3.5: Mid-Trade Checkpoint (Trending only) ----------------
     CHECKPOINT_DELAY_SECONDS = 60
@@ -1240,10 +1455,14 @@ class v12_Strategy(IStrategy):
                                       # is roughly 24 minutes of history if
                                       # trades are frequent enough to keep
                                       # the cache populated continuously —
-                                      # in practice, with this bot's ~60-105s
-                                      # trade lifetimes (Phase 3 time-bomb),
-                                      # actual wall-clock coverage will be
-                                      # far patchier and dominated by
+                                      # in practice, with this bot's trade
+                                      # lifetimes (Phase 3 time-bomb: ~60s
+                                      # ranging, up to TRENDING_TIMEBOMB_
+                                      # SECONDS=1200s trending as of AUDIT
+                                      # FIX L 2026-09-08 — was ~105s before
+                                      # that fix), actual wall-clock
+                                      # coverage will be far patchier and
+                                      # dominated by
                                       # between-trade gaps. This is a
                                       # DELIBERATE APPROXIMATION, not
                                       # Delta's own IV Rank (Delta's ticker
@@ -1728,17 +1947,55 @@ class v12_Strategy(IStrategy):
         # Phase-1 already, per blueprint's table row 4 ("Phase 1 mein hi
         # reject") — enforced here via long_direction_ok / short_direction_ok
         # already requiring direction_confident (gap>=4).
+        #
+        # AUDIT FIX I (2026-09-08): the breakout_magnitude_* condition below
+        # used to be `> 0`, which passed on ANY positive clearance over the
+        # prior 20-candle high/low — a 0.001x-ATR breakout qualified exactly
+        # as validly as a 2x-ATR one. HIGH_TIER_BREAKOUT_PTS (0.5x ATR)
+        # looked like it already guarded this, but that constant is only
+        # ever read afterward (is_high_tier below) to decide immediate-vs-
+        # wait-and-reverify TIMING on an entry that has already triggered —
+        # it never gated whether a marginal, near-noise breakout could
+        # trigger at all. Now floored at MIN_ENTRY_BREAKOUT_PTS (see that
+        # constant's own comment) so a trade is only considered once the
+        # breakout has some real, ATR-scaled size, not merely a positive
+        # sign. This is the direct fix for backtest report Part 3 root
+        # cause #3 / Part 4 item 3.
+        #
+        # AUDIT FIX K (2026-09-08): smc_gate_passed_long/short — computed
+        # in populate_indicators since the 2026-09-06 SMC feature addition
+        # — was NEVER read by any entry-path condition anywhere in this
+        # file (confirmed by searching every method for "smc_gate_passed").
+        # SMC_GATE_ENABLED=True (the default) therefore had ZERO effect on
+        # live/backtest behavior: the gate computed its pass/fail columns
+        # every candle and then nothing ever consumed them, silently
+        # defeating the entire "2026-09-06 FEATURE ADDITION" this file's
+        # own header describes (a gate meant to reject "retail-trap"
+        # breakouts stacked ON TOP OF the existing tier gate). Now wired in
+        # here, exactly where that header block says it belongs: stacked
+        # onto the Trending trigger via AND, so a SMC-gate failure blocks
+        # entry the same way a direction or breakout-magnitude failure
+        # already does, while SMC_GATE_ENABLED=False continues to no-op
+        # cleanly (smc_gate_passed_* is hardcoded True in that branch in
+        # populate_indicators, so this AND is a no-op exactly as intended).
+        # Ranging entries are deliberately NOT gated here, unchanged from
+        # before — the blueprint doc this gate was built from scopes it to
+        # Trending breakouts only (see the "2026-09-06 FEATURE ADDITION"
+        # header block), and this file has never defined a Ranging-side
+        # SMC gate.
         trend_long_trigger = (
             trending
             & long_direction_ok
-            & (dataframe["breakout_magnitude_long"] > 0)
+            & (dataframe["breakout_magnitude_long"] >= self.MIN_ENTRY_BREAKOUT_PTS)
             & dataframe["tick_consistency_long"]
+            & dataframe["smc_gate_passed_long"]
         )
         trend_short_trigger = (
             trending
             & short_direction_ok
-            & (dataframe["breakout_magnitude_short"] > 0)
+            & (dataframe["breakout_magnitude_short"] >= self.MIN_ENTRY_BREAKOUT_PTS)
             & dataframe["tick_consistency_short"]
+            & dataframe["smc_gate_passed_short"]
         )
 
         # --- Ranging entries: bounce off local low/high -------------------
@@ -2747,8 +3004,63 @@ class v12_Strategy(IStrategy):
 
     # =====================================================================
     # PHASE 3: Capital Shield — Time-Bomb exit.
-    # Ranging: 60s adaptive (scaled by volatility ratio). Trending: 90-120s
-    # (midpoint 105s), explicitly NOT adaptive per blueprint text.
+    # Ranging: 60s adaptive (scaled by volatility ratio). Trending: was
+    # 90-120s (blueprint midpoint 105s) before AUDIT FIX L (2026-09-08)
+    # raised the fixed trending ceiling to 1200s — see
+    # TRENDING_TIMEBOMB_SECONDS's own definition above for the full
+    # derivation. Still explicitly NOT adaptive per blueprint text; AUDIT
+    # FIX L changed the fixed value itself, not whether it's fixed.
+    #
+    # AUDIT FIX J (2026-09-08): PROFIT-AWARE EXEMPTION.
+    # Previously this method took `current_profit` as a parameter and never
+    # read it anywhere in its body — the timebomb fired purely on elapsed
+    # time, closing a trade at the trending ceiling whether it was up,
+    # down, or flat. The 2026-09-08 backtest report traced this directly to
+    # 195 of 204 losing trades (Part 3, root causes #1-#2): under the
+    # ORIGINAL 105s ceiling, that meant a fixed 1.75-minute exit
+    # force-closing trades built on a 20-minute entry signal, before that
+    # signal had any real time to play out. AUDIT FIX L (see that
+    # constant's own comment) addresses the ceiling itself; this fix
+    # (AUDIT FIX J) is a separate, complementary improvement layered on
+    # top of whatever the current ceiling is — it lets a trade that is
+    # ALREADY working exit under Phase 4's trailing logic before even the
+    # new, longer ceiling is reached, rather than waiting out the full
+    # timer once profit target is clearly met.
+    #
+    # FIX: before firing the timebomb, check whether the trade has already
+    # cleared TIMEBOMB_PROFIT_EXEMPT_PTS of genuine, ATR-scaled profit. If
+    # so, skip the timebomb entirely and let Phase 4's trailing-stop logic
+    # (already running independently inside custom_stoploss, armed via
+    # TRAILING_RANGING_PTS/TRAILING_TRENDING_PTS) manage the exit instead.
+    # Phase 4 does not depend on this method firing — it re-evaluates and
+    # ratchets the stop every iteration regardless of what custom_exit
+    # returns — so exempting a profitable trade here does not leave it
+    # unprotected; it hands control to a mechanism designed to let a
+    # winning trade run rather than a mechanism designed to cap how long
+    # ANY trade (winning or losing) is allowed to stay open.
+    #
+    # IMPORTANT — WHAT AUDIT FIX J DOES AND DOES NOT COVER ON ITS OWN: a
+    # trade that never reaches TIMEBOMB_PROFIT_EXEMPT_PTS (most trades, if
+    # the entry has no demonstrated edge over this time horizon — see the
+    # report's own p-value finding) is NOT helped by this exemption at all;
+    # it is still time-bombed at exactly the ceiling AUDIT FIX L sets, no
+    # sooner and no later. Fixing that exposure for the majority of trades
+    # is AUDIT FIX L's job (giving the entry signal genuinely more time to
+    # play out), not this exemption's — a point raised directly after this
+    # exemption was first implemented alone, which is why AUDIT FIX L
+    # exists as a second, separate change rather than treating this
+    # exemption as sufficient by itself.
+    #
+    # This computes profit in the same open_rate-relative, atr_scale-scaled
+    # "points" unit that custom_stoploss's own profit_pts/breakeven/
+    # trailing math already uses (state["atr_scale"] is frozen at entry —
+    # see AUDIT FIX E/that method's own comments), rather than the
+    # `current_profit` percentage argument, so this new threshold is
+    # directly comparable to TIMEBOMB_PROFIT_EXEMPT_PTS and to every other
+    # profit-distance constant in this file. A trade below this profit
+    # level, or at a loss, is still time-bombed exactly as before — this
+    # does not remove the timer, it only stops it from force-closing a
+    # trade that has already moved the right way by a real amount.
     #
     # PHASE 5: Kill-Switch bookkeeping happens here too, since custom_exit
     # is called every iteration for open trades and is a natural place to
@@ -2781,10 +3093,47 @@ class v12_Strategy(IStrategy):
             timebomb_seconds = self.TRENDING_TIMEBOMB_SECONDS  # NOT adaptive, per blueprint
 
         if seconds_open >= timebomb_seconds:
+            # AUDIT FIX J: compute profit in atr_scale-adjusted points, the
+            # same unit custom_stoploss's breakeven/trailing math already
+            # uses, so this is comparable across pairs of very different
+            # price levels (see the "CROSS-PAIR SCALE FIX" comments on
+            # breakout_magnitude_*/custom_stoploss above for the same
+            # convention applied elsewhere in this file).
+            atr_scale = state.get("atr_scale", 1.0)
+            is_long = not trade.is_short
+            if atr_scale and atr_scale > 0:
+                profit_pts = (
+                    (current_rate - trade.open_rate)
+                    if is_long
+                    else (trade.open_rate - current_rate)
+                ) / atr_scale
+            else:
+                # Defensive fallback if atr_scale was never populated for
+                # this trade (should not happen post-entry, but this method
+                # must never raise on a malformed/missing state dict — see
+                # this file's existing "fail loud, never silently swallow"
+                # standard elsewhere, applied here as "never let a missing
+                # optimization exempt a trade AND never crash the bot" by
+                # falling back to the pre-fix, always-fire behavior).
+                profit_pts = 0.0
+
+            if profit_pts >= self.TIMEBOMB_PROFIT_EXEMPT_PTS:
+                logger.info(
+                    "[Phase3-TimeBomb] %s trade#%s: time-bomb threshold "
+                    "reached at %.1fs but trade is +%.2fpt (>= exempt "
+                    "threshold %.2fpt) — skipping forced exit, leaving "
+                    "Phase 4 trailing-stop in control.",
+                    pair, trade.id, seconds_open, profit_pts,
+                    self.TIMEBOMB_PROFIT_EXEMPT_PTS,
+                )
+                return None
+
             logger.info(
                 "[Phase3-TimeBomb] %s trade#%s: time-bomb exit at %.1fs "
-                "(threshold=%.1fs, regime=%s).",
+                "(threshold=%.1fs, regime=%s, profit=%.2fpt, below exempt "
+                "threshold %.2fpt).",
                 pair, trade.id, seconds_open, timebomb_seconds, regime,
+                profit_pts, self.TIMEBOMB_PROFIT_EXEMPT_PTS,
             )
             return "phase3_timebomb_exit"
 
@@ -3496,6 +3845,25 @@ class v12_Strategy(IStrategy):
         "24hr consecutive-SL" window from Freqtrade's own trade database on
         startup, so a crash/restart (see WATCHDOG below) no longer silently
         erases the kill-switch's memory.
+
+        AUDIT FIX K (2026-09-08): the exit-reason match below now mirrors
+        confirm_trade_exit's is_stoploss_exit check exactly (AUDIT FIX G,
+        2026-09-06 — see that method's own comment for the full trace of
+        why "liquidation" belongs here). Before this fix, this method only
+        matched "stop_loss" in exit_reason, while confirm_trade_exit's
+        LIVE-running check already also matched "liquidation" — the two
+        paths that both exist purely to count the same thing (severe-loss
+        streaks toward the same 24h kill-switch window) had silently
+        drifted out of sync. Concretely: a run of liquidation exits handled
+        live would correctly increment self._sl_streak and could flag the
+        kill-switch, mid-session, exactly as designed — but if the bot then
+        restarted, THIS method would rebuild the streak from trade history
+        counting only the "stop_loss" exits and silently drop every
+        liquidation from the reconstructed count, potentially un-flagging
+        a pair (or never re-flagging it) that live-tracking had correctly
+        flagged before the restart. Fixed by using the identical substring
+        match confirm_trade_exit already uses, so a restart can never
+        produce a LOOSER kill-switch state than live-tracking would have.
         """
         try:
             cutoff = datetime.now(timezone.utc) - timedelta(
@@ -3505,7 +3873,18 @@ class v12_Strategy(IStrategy):
                 [Trade.close_date >= cutoff, Trade.is_open == False]
             ).order_by(Trade.close_date.asc())
             for t in closed_trades:
-                if t.exit_reason and "stop_loss" in t.exit_reason.lower():
+                # AUDIT FIX K: matches confirm_trade_exit's is_stoploss_exit
+                # exactly (stop_loss substring, exact "stoploss", OR
+                # liquidation substring) — see that method's AUDIT FIX G
+                # comment for why liquidation counts as a severe-loss exit
+                # here too, and this docstring above for why the two checks
+                # must never be allowed to drift apart again.
+                is_severe_exit = t.exit_reason and (
+                    "stop_loss" in t.exit_reason.lower()
+                    or t.exit_reason == "stoploss"
+                    or "liquidation" in t.exit_reason.lower()
+                )
+                if is_severe_exit:
                     self._sl_streak.setdefault(t.pair, []).append(t.close_date)
             for pair, streak in self._sl_streak.items():
                 if len(streak) >= self.KILL_SWITCH_CONSECUTIVE_SL:
