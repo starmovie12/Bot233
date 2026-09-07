@@ -80,6 +80,20 @@
   "$comment_exchange_12h": "This is why the bot was hitting production api.bybit.com (and getting",
   "$comment_exchange_12i": "CloudFront-blocked by Render's region) instead of Bybit's demo/testnet",
   "$comment_exchange_12j": "endpoint the config intended.",
+  "$comment_exchange_12k": "FIX (2026-09-08): reverted demo_trading back to false. Freqtrade",
+  "$comment_exchange_12l": "2026.9's configuration validator now explicitly rejects dry_run=true",
+  "$comment_exchange_12m": "combined with exchange.demo_trading=true ('Demo trading cannot be",
+  "$comment_exchange_12n": "used together with dry_run.') — this was not previously enforced,",
+  "$comment_exchange_12o": "but the installed dev build (2026.9.dev0) does enforce it now. Since",
+  "$comment_exchange_12p": "key/secret below are still blank (no real Bybit demo API keys have",
+  "$comment_exchange_12q": "been generated), demo_trading=true cannot work standalone either —",
+  "$comment_exchange_12r": "so dry_run=true / demo_trading=false (pure Freqtrade-internal paper",
+  "$comment_exchange_12s": "trading against live Bybit market data, no exchange auth needed) is",
+  "$comment_exchange_12t": "the only mode that actually runs with the current, empty credentials.",
+  "$comment_exchange_12u": "To use Bybit's real demo-trading environment instead: generate a",
+  "$comment_exchange_12v": "demo-only key/secret pair from Bybit, fill them in below (or via env",
+  "$comment_exchange_12w": "vars), set demo_trading back to true, AND set dry_run to false — all",
+  "$comment_exchange_12x": "three together, or the validator will reject it again.",
   "$comment_exchange_13": "This needs its OWN separate API key pair generated specifically in",
   "$comment_exchange_14": "Bybit's demo-trading environment — NOT your real Bybit account keys.",
   "$comment_exchange_15": "Combined with dry_run=true above, trades are simulated twice over —",
@@ -93,7 +107,7 @@
   "$comment_exchange_23": "and the top-level 'dry_run' to false — not just one.",
   "exchange": {
     "name": "bybit",
-    "demo_trading": true,
+    "demo_trading": false,
     "key": "",
     "secret": "",
     "ccxt_config": {},
@@ -140,7 +154,7 @@
   ],
 
   "entry_pricing": {
-    "price_side": "same",
+    "price_side": "other",
     "use_order_book": true,
     "order_book_top": 1,
     "check_depth_of_market": {
@@ -148,7 +162,7 @@
     }
   },
   "exit_pricing": {
-    "price_side": "same",
+    "price_side": "other",
     "use_order_book": true,
     "order_book_top": 1
   },
