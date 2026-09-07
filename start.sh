@@ -22,6 +22,20 @@
 #                     defeating the point of having one — generate via
 #                     `python3 -c "import secrets; print(secrets.token_urlsafe(25))"`
 #
+#   HEARTBEAT_STALE_SECONDS — ADDED 2026-09-07: seconds of heartbeat
+#                     silence before this script kills the freqtrade
+#                     process itself (default 300 = 5min, well above the
+#                     5s process_throttle_secs). See the heartbeat watcher
+#                     block near the bottom of this file: Render only
+#                     restarts a Background Worker when the PROCESS EXITS
+#                     — a hung-but-still-running process (blocked network
+#                     call, deadlock, etc.) is invisible to Render with no
+#                     active health check configured. This makes a hang
+#                     self-terminate so Render's normal restart-on-exit
+#                     behavior actually kicks in instead of leaving a
+#                     zombie process (and, via max_open_trades, a
+#                     permanently stuck bot) running forever.
+#
 # If DB_URL is unset, this falls back to the SQLite path already in
 # config.json — that's fine for a quick test, but see RISK_AND_LIMITATIONS.md
 # for why that means data loss on every Render restart.
@@ -82,4 +96,42 @@ exec freqtrade trade \
   --config "$RUNTIME_CONFIG" \
   --strategy v12_Strategy \
   --logfile /freqtrade/user_data/logs/freqtrade.log \
-  $DB_URL_ARG
+  $DB_URL_ARG &
+FREQTRADE_PID=$!
+
+# ---------------------------------------------------------------------------
+# HEARTBEAT WATCHDOG (ADDED 2026-09-07, Tier-1 fix).
+#
+# Render's Background Worker restarts a service when its process EXITS —
+# it does not health-check a still-running-but-hung process. If freqtrade
+# blocks forever on a network call or similar (no active health check
+# exists for this deployment type), Render never notices and the bot can
+# sit frozen indefinitely — which, combined with max_open_trades, means a
+# permanently stuck trade with no automatic recovery.
+#
+# v12_Strategy.py's bot_loop_start() now touches
+# /tmp/freqtrade_heartbeat on every loop iteration (see that method). This
+# loop below checks that file's mtime every 30s; if it goes stale for
+# longer than HEARTBEAT_STALE_SECONDS, it kills the freqtrade process,
+# which makes Render's normal restart-on-exit behavior actually fire.
+# ---------------------------------------------------------------------------
+HEARTBEAT_FILE=/tmp/freqtrade_heartbeat
+STALE_LIMIT="${HEARTBEAT_STALE_SECONDS:-300}"
+touch "$HEARTBEAT_FILE" 2>/dev/null || true
+
+while kill -0 "$FREQTRADE_PID" 2>/dev/null; do
+  sleep 30
+  if [ -f "$HEARTBEAT_FILE" ]; then
+    LAST_BEAT=$(date -r "$HEARTBEAT_FILE" +%s 2>/dev/null || echo 0)
+    NOW=$(date +%s)
+    AGE=$((NOW - LAST_BEAT))
+    if [ "$AGE" -gt "$STALE_LIMIT" ]; then
+      echo "WATCHDOG: heartbeat stale for ${AGE}s (limit ${STALE_LIMIT}s)." \
+           "Killing freqtrade (pid $FREQTRADE_PID) so Render restarts it."
+      kill -9 "$FREQTRADE_PID" 2>/dev/null || true
+      break
+    fi
+  fi
+done
+
+wait "$FREQTRADE_PID"
