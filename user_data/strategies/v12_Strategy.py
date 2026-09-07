@@ -368,9 +368,81 @@
 #      CHECKPOINT_DELAY_SECONDS's relative timing and the watchdog's
 #      auto-scaled 2x backstop.
 #
-#      NONE of I/J/K/D/L have been re-backtested yet as of this writing.
-#      See the companion v12_Strategy_Backtest_Analysis.md report's Part 5
-#      for what changed, what didn't, and why a code fix here is not yet a
+#   M. confirm_trade_entry's Phase 5 kill-switch block logged its full
+#      WARNING text on EVERY call, once a pair was flagged — and this
+#      method is called once per bot-loop iteration for any pair with an
+#      active entry signal (process_throttle_secs apart, realistic floor
+#      ~1s; see gap #1 above). A flagged pair that keeps generating entry
+#      signals for hours/days (the flag is never cleared once set — see
+#      that dict's own comment in __init__) produced thousands of
+#      byte-identical log lines, drowning out every other WARNING in the
+#      log. This is a pure logging/observability defect, NOT a change to
+#      the kill-switch's actual behavior: the block itself (returning
+#      False, refusing the entry) fires on every call exactly as before.
+#      FIXED by throttling the LOG WRITE (not the block) to at most once
+#      per KILL_SWITCH_LOG_THROTTLE_SECONDS (new constant, 300s default)
+#      per pair, logging the first occurrence immediately so the flag's
+#      onset is never silent.
+#
+#   N. bot_loop_start's stuck-trade watchdog backstop was
+#      `2 * TRENDING_TIMEBOMB_SECONDS`, applied to EVERY open trade
+#      regardless of that trade's own regime. This was a reasonable
+#      approximation when TRENDING_TIMEBOMB_SECONDS was 105s, but fix L
+#      raised it to 1200s, which silently dragged the watchdog to 2400s
+#      (40 minutes) for RANGING trades too — even though a ranging trade's
+#      own timer (RANGING_TIMEBOMB_SECONDS=60s, adaptive) is unrelated in
+#      scale. A stalled ranging trade could sit open for up to 40 minutes
+#      before the backstop force-closed it. Not caught when fix L was
+#      made, since that fix only checked that the backstop "scales,"
+#      not whether regime-blindness made the scaled value wrong for the
+#      other regime. FIXED by looking up each open trade's own frozen
+#      regime (same state dict custom_exit reads) and basing the backstop
+#      on the matching timebomb constant, falling back to the old
+#      TRENDING-based limit only when a trade's regime can't be
+#      determined (e.g. state not yet restored after a restart).
+#
+#   O. The Medium-tier wait's Step A/B/C re-verification in
+#      confirm_trade_entry (the wait/re-verify state machine, distinct
+#      from populate_entry_trend's initial trigger) re-checks regime,
+#      direction, and ADX/DI margins on FRESH data before firing — but
+#      never re-checked the SMC Structural Confirmation Gate (fix K) on
+#      that same fresh data. A Medium-tier signal that passed the gate at
+#      its ORIGINAL trigger candle could wait 1-2 cycles and then fire
+#      purely on Step C's fresh_tier result, even if FVG/BOS/OB structure
+#      had since changed enough that the gate would no longer pass (order
+#      blocks can invalidate, FVGs can age out of their lookback window,
+#      both within 1-2 bot-loop iterations). Invisible before fix K, since
+#      smc_gate_passed_* had zero effect on anything until that fix; now
+#      that the gate is load-bearing, this path needs to honor it too.
+#      FIXED by re-checking smc_gate_passed_long/short on fresh data
+#      immediately after Step A, before Step B/C run, skipping (consuming
+#      the wait, same as a Step A failure) if the gate no longer passes.
+#      No-ops cleanly when SMC_GATE_ENABLED=False.
+#
+#   P. RANGING_TIMEBOMB_SECONDS=60 was FLAGGED, NOT CHANGED, when a
+#      reviewer correctly asked why fix L raised the TRENDING timer but
+#      left the RANGING one untouched. Root Cause #2 / fix L's own
+#      justification for raising TRENDING_TIMEBOMB_SECONDS was that the
+#      trending entry reads a 20-candle (20min) rolling window but only
+#      got 105s to resolve — that specific comparison was made ONLY for
+#      the trending side and was never actually checked for ranging. The
+#      ranging entry trigger ALSO reads the same rolling_low_20/
+#      rolling_high_20 window, so it is not obviously exempt from the same
+#      reasoning — but a ranging bounce is a mean-reversion setup, not a
+#      breakout-continuation setup, so copying fix L's 1200s onto
+#      RANGING_TIMEBOMB_SECONDS without justification would be exactly the
+#      kind of unjustified, non-empirical change this file avoids
+#      elsewhere. The backtest report's Part 2 numbers also don't break
+#      the loss pattern down by regime, so it isn't currently known
+#      whether ranging trades show the same "cut short before any real
+#      move" pattern trending trades did. See the detailed comment at the
+#      top of custom_exit (search "AUDIT FIX P") for the full reasoning
+#      and what to check before changing this constant.
+#
+#      NONE of I/J/K/D/L/M/N/O/P have been re-backtested yet as of this
+#      writing (P made no code-behavior change — see above). See the
+#      companion v12_Strategy_Backtest_Analysis.md report's Part 5/6/7 for
+#      what changed, what didn't, and why a code fix here is not yet a
 #      confirmed outcome fix.
 # =============================================================================
 
@@ -1224,6 +1296,13 @@ class v12_Strategy(IStrategy):
 
     # --- Phase 3: Capital Shield -----------------------------------------
     RANGING_BREAKEVEN_TRIGGER_PTS = 2.0
+    # AUDIT FIX P (2026-09-08): flagged, NOT changed — see this constant's
+    # own detailed comment further down (search "AUDIT FIX P" near
+    # custom_exit) for why 60s was never actually checked against Root
+    # Cause #2's own reasoning, and why this file is NOT silently raising
+    # it the way AUDIT FIX L raised TRENDING_TIMEBOMB_SECONDS. Read that
+    # comment before assuming either that 60s is fine, or that it needs
+    # the same fix trending got.
     RANGING_TIMEBOMB_SECONDS = 60  # adaptive, scaled by volatility ratio
     TRENDING_BREAKEVEN_TRIGGER_PTS = 4.5  # blueprint gives 4-5pt; midpoint
 
@@ -1348,6 +1427,16 @@ class v12_Strategy(IStrategy):
     # --- Phase 5: Kill-Switch --------------------------------------------
     KILL_SWITCH_CONSECUTIVE_SL = 3
     KILL_SWITCH_WINDOW_HOURS = 24
+
+    # AUDIT FIX M (2026-09-08): minimum gap, in seconds, between repeated
+    # log lines for the SAME pair's kill-switch entry block in
+    # confirm_trade_entry. Does not affect the block itself (still fires
+    # every iteration, per blueprint intent) — only throttles how often
+    # that fact gets written to the log. 300s (5min) is a starting point:
+    # frequent enough that the block's continued presence is still visible
+    # in the log, infrequent enough that a flagged pair sitting through
+    # most of a 24h window doesn't produce thousands of duplicate lines.
+    KILL_SWITCH_LOG_THROTTLE_SECONDS = 300
 
     # =====================================================================
     # OPTIONS RISK OVERLAY (Delta Exchange live data) — resolves FIDELITY
@@ -1578,6 +1667,24 @@ class v12_Strategy(IStrategy):
         # long-side vs short-side).
         self._sl_streak: dict[str, list[datetime]] = {}
         self._kill_switch_flagged: dict[str, bool] = {}
+
+        # AUDIT FIX M (2026-09-08): last time each pair's kill-switch block
+        # was actually WRITTEN to the log, keyed by pair. confirm_trade_entry
+        # is called once per bot-loop iteration for every pair with an active
+        # signal (process_throttle_secs apart, realistic floor ~1s — see
+        # FIDELITY GAP #1 at the top of this file). Once a pair is flagged,
+        # it can keep generating entry signals every single iteration for as
+        # long as the 24h window stays open, and each of those iterations
+        # was re-logging the FULL warning text at WARNING level with no
+        # throttling — thousands of byte-identical lines per pair per day,
+        # drowning out every other WARNING in the log (this is exactly what
+        # produced the multi-thousand-line repeated-warning dump seen in
+        # practice). This dict lets the block below log the first
+        # occurrence immediately, then at most once per
+        # KILL_SWITCH_LOG_THROTTLE_SECONDS after that, per pair — the block
+        # itself (returning False from confirm_trade_entry) is completely
+        # unaffected; only how often it WRITES about doing so changes.
+        self._kill_switch_last_logged: dict[str, datetime] = {}
 
         # RESTART-SAFE STATE FIX (2026-09-07): resolve the on-disk path
         # for _medium_tier_wait persistence (see the long comment on that
@@ -2113,14 +2220,38 @@ class v12_Strategy(IStrategy):
         # you can consciously decide whether you want a hard block or a
         # log-only diagnostic here.
         if self._kill_switch_flagged.get(pair, False):
-            logger.warning(
-                "[Phase5-KillSwitch] %s: blocking new entry — 3rd consecutive "
-                "SL flag active within %sh window. This is an IMPLEMENTATION "
-                "CHOICE (blueprint leaves action-on-flag as an open "
-                "question) — see comment above this check to change it.",
-                pair,
-                self.KILL_SWITCH_WINDOW_HOURS,
+            # AUDIT FIX M (2026-09-08): this used to log the full WARNING
+            # every single call — once per bot-loop iteration, for as long
+            # as the pair kept generating an entry signal while flagged
+            # (see FIDELITY GAP #1: iterations are process_throttle_secs
+            # apart, realistic floor ~1s). That produced thousands of
+            # byte-identical log lines per pair per day and drowned out
+            # every other WARNING in the log. The block itself (returning
+            # False, refusing the entry) is unchanged and still happens on
+            # EVERY call — only the logging is now throttled to at most
+            # once per KILL_SWITCH_LOG_THROTTLE_SECONDS per pair, logging
+            # the first occurrence immediately so it's never silent.
+            last_logged = self._kill_switch_last_logged.get(pair)
+            should_log = (
+                last_logged is None
+                or (current_time - last_logged).total_seconds()
+                >= self.KILL_SWITCH_LOG_THROTTLE_SECONDS
             )
+            if should_log:
+                logger.warning(
+                    "[Phase5-KillSwitch] %s: blocking new entry — 3rd "
+                    "consecutive SL flag active within %sh window. This is "
+                    "an IMPLEMENTATION CHOICE (blueprint leaves "
+                    "action-on-flag as an open question) — see comment "
+                    "above this check to change it. (Further repeats of "
+                    "this message for %s are throttled to once per %ds "
+                    "while the flag remains active — see AUDIT FIX M.)",
+                    pair,
+                    self.KILL_SWITCH_WINDOW_HOURS,
+                    pair,
+                    self.KILL_SWITCH_LOG_THROTTLE_SECONDS,
+                )
+                self._kill_switch_last_logged[pair] = current_time
             return False
 
         # --- Phase 0.6: Options Pre-Entry Filter (Theta decay / IV Rank) --
@@ -2274,6 +2405,48 @@ class v12_Strategy(IStrategy):
             wait_state["consumed"] = True
             self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
             return False
+
+        # AUDIT FIX O (2026-09-08): re-check the SMC Structural Confirmation
+        # Gate (AUDIT FIX K) here, on FRESH data, before firing. Before this
+        # fix, a Medium-tier signal that passed the SMC gate at its ORIGINAL
+        # trigger candle (populate_entry_trend, where AUDIT FIX K wires the
+        # gate into trend_long_trigger/trend_short_trigger) could then wait
+        # 1-2 cycles and fire on Step C's fresh_tier result WITHOUT the gate
+        # ever being re-evaluated — Step A only re-checks regime/direction,
+        # Step B/C only re-check ADX/DI margins (breakout magnitude and
+        # tick-consistency are deliberately frozen per the blueprint's own
+        # scope limitation, see Step B's comment below, but the blueprint
+        # text predates the SMC gate entirely, so it never actually took a
+        # position on this). Concretely: FVG/OB/BOS structure can (and does)
+        # change within 1-2 bot-loop iterations — an order block can be
+        # invalidated, an FVG can move outside its lookback window — so a
+        # signal that legitimately passed the gate 1-2 iterations ago is not
+        # guaranteed to still pass it now. This was invisible before AUDIT
+        # FIX K, since smc_gate_passed_* had zero effect on anything; now
+        # that the gate is load-bearing, this path needs to honor it the
+        # same way the immediate-fire (High-tier) path already implicitly
+        # does (High-tier never waits, so it only ever sees the gate's
+        # trigger-candle value — which for High-tier IS the current value,
+        # by construction). No-ops cleanly when SMC_GATE_ENABLED=False,
+        # same convention as everywhere else in this file.
+        if self.SMC_GATE_ENABLED:
+            fresh_smc_gate_passed = (
+                candle["smc_gate_passed_long"]
+                if side == "long"
+                else candle["smc_gate_passed_short"]
+            )
+            if not fresh_smc_gate_passed:
+                logger.info(
+                    "[Phase1.5-StepA-SMC] %s: Medium-tier wait complete, "
+                    "fresh SMC Structural Confirmation Gate check FAILED "
+                    "(side=%s) — the gate passed at the original trigger "
+                    "candle but no longer does on fresh data; skipping per "
+                    "blueprint's skip-on-doubt principle (see AUDIT FIX O).",
+                    pair, side,
+                )
+                wait_state["consumed"] = True
+                self._persist_medium_tier_wait()  # RESTART-SAFE STATE FIX
+                return False
 
         # Step B: fresh ADX-margin / DI-gap-margin. Breakout magnitude and
         # tick-consistency stay at their ORIGINAL trigger-moment values per
@@ -3086,6 +3259,64 @@ class v12_Strategy(IStrategy):
         regime = state.get("regime", "trending")
         seconds_open = (current_time - trade.open_date_utc).total_seconds()
 
+        # AUDIT FIX P (2026-09-08) — FLAGGED, NOT CHANGED. Read this before
+        # assuming RANGING_TIMEBOMB_SECONDS=60 is either fine or needs the
+        # same fix TRENDING_TIMEBOMB_SECONDS got (AUDIT FIX L).
+        #
+        # Root Cause #2 in the backtest report (and AUDIT FIX L's own
+        # justification) argued that a 105s trending timer was too short
+        # because the TRENDING entry signal is built from a 20-candle
+        # (20-minute, on this 1m timeframe) rolling high/low — the timer
+        # gave the trade roughly 1/11th of its own entry signal's time
+        # horizon to play out. That comparison was made ONLY for the
+        # trending side. It was never made for ranging entries, and
+        # RANGING_TIMEBOMB_SECONDS (60s, further scaled by this trade's own
+        # entry_volatility_ratio below) was left at its original value on
+        # the unstated assumption that ranging trades don't have the same
+        # mismatch. That assumption was never actually checked:
+        #
+        #   - The ranging entry trigger (populate_entry_trend,
+        #     ranging_long_trigger/ranging_short_trigger) ALSO reads
+        #     rolling_low_20/rolling_high_20 — the identical 20-candle
+        #     window the trending trigger uses for its breakout level —
+        #     then additionally requires a small ATR-scaled bounce
+        #     (2.0 x ATR) off that level. So the ranging signal is not
+        #     obviously "shorter-horizon" than the trending one in terms of
+        #     the underlying structure it's reading; it uses the SAME
+        #     window, plus one extra confirmation step.
+        #   - However, unlike a trending breakout (a directional move
+        #     expected to continue), a ranging bounce is a mean-reversion
+        #     setup — the blueprint's own framing is a quick bounce off a
+        #     local extreme, not a sustained trend continuation. Whether
+        #     that kind of setup SHOULD get 20 minutes to resolve, the way
+        #     a breakout arguably should, is a genuine open question this
+        #     file is not going to answer by just copying AUDIT FIX L's
+        #     1200s onto the ranging side without justification — the two
+        #     entry types are not the same shape, even though they share a
+        #     lookback window.
+        #   - The backtest report's Part 2 numbers (204 trades, 105s
+        #     trending timer) do NOT break the loss pattern down by regime
+        #     at all — it is not currently known from the existing data how
+        #     many of those 204 trades were ranging trades being cut short
+        #     by this same 60s-vs-20-candle mismatch, versus trending
+        #     trades hitting the (separately, already-fixed) 105s problem.
+        #     Without that breakdown, raising RANGING_TIMEBOMB_SECONDS would
+        #     be exactly the kind of unjustified, non-empirical change this
+        #     file's own standard elsewhere explicitly avoids (see e.g. the
+        #     leverage() method's comment on not inventing a blueprint-
+        #     unspecified number).
+        #
+        # NOT FIXED, DELIBERATELY: RANGING_TIMEBOMB_SECONDS is left at 60
+        # here. Before changing it, re-run Part 2's same backtest with the
+        # exit-reason breakdown split by regime (trade.enter_tag or the
+        # persisted state's "regime" field can distinguish trending vs.
+        # ranging trades in the results) to actually see whether ranging
+        # trades show the same "cut short before any real move" pattern
+        # Root Cause #1/#2 documented for trending trades. If they do, this
+        # constant needs its own deliberate value — not necessarily 1200s —
+        # chosen the same way AUDIT FIX L's 1200s was: reasoned from what a
+        # ranging bounce setup should actually be given to resolve, not
+        # picked by analogy to the trending fix.
         if regime == "ranging":
             vol_ratio = state.get("entry_volatility_ratio", 1.0)
             timebomb_seconds = self.RANGING_TIMEBOMB_SECONDS * vol_ratio
@@ -3334,9 +3565,21 @@ class v12_Strategy(IStrategy):
         # PHASE 5: Kill-Switch bookkeeping.
         # "Do independent counters, 3rd-consecutive-SL dono mein 24hr-window
         # -> Correlated-Failure Log Flag."
-        # FIDELITY GAP #5: in-memory only, resets on bot restart. See the
-        # commented rebuild-from-trade-history stub below this method for
-        # how to persist this against Freqtrade's own trade DB instead.
+        # FIDELITY GAP #5 (2026-09-08 correction): this comment previously
+        # said self._sl_streak/_kill_switch_flagged were "in-memory only,
+        # resets on bot restart," and pointed at a "commented rebuild-from-
+        # trade-history stub below this method." That description is
+        # STALE — _rebuild_kill_switch_from_trade_history is a real,
+        # active method (not a stub, not commented out), called from
+        # bot_loop_start() on the first iteration after every (re)start,
+        # and AUDIT FIX K keeps its exit-reason match in sync with the
+        # is_stoploss_exit check directly below. self._sl_streak and
+        # self._kill_switch_flagged ARE still pure in-memory dicts that go
+        # empty on restart — that underlying fact hasn't changed — but the
+        # rebuild is real and already wired, not a to-do left for later.
+        # This comment was left un-updated when that method was written,
+        # which could have misled a future reader into re-implementing
+        # something that already exists — corrected here, no code change.
         # -----------------------------------------------------------------
         if is_stoploss_exit:
             streak = self._sl_streak.setdefault(pair, [])
@@ -3949,8 +4192,30 @@ class v12_Strategy(IStrategy):
             self._rebuild_kill_switch_from_trade_history()
             self._restore_medium_tier_wait()  # RESTART-SAFE STATE FIX
 
-        watchdog_limit_seconds = 2 * self.TRENDING_TIMEBOMB_SECONDS
-
+        # AUDIT FIX N (2026-09-08): this backstop used to be a single
+        # regime-blind limit, `2 * TRENDING_TIMEBOMB_SECONDS`, applied to
+        # EVERY open trade regardless of which regime it actually opened
+        # under. That was a reasonable approximation back when
+        # TRENDING_TIMEBOMB_SECONDS was 105s (a 210s/3.5min backstop was
+        # already generous for a 60s RANGING_TIMEBOMB_SECONDS trade too).
+        # But AUDIT FIX L raised TRENDING_TIMEBOMB_SECONDS to 1200s, which
+        # silently dragged this watchdog up to 2400s (40 minutes) for
+        # EVERY trade, including ranging-regime ones whose own custom_exit
+        # timer (RANGING_TIMEBOMB_SECONDS=60s, adaptive by volatility
+        # ratio) is unrelated in scale — a stalled ranging trade could now
+        # sit open for up to 40 minutes before this backstop force-closes
+        # it, instead of a limit actually proportional to that trade's own
+        # ~60-120s expected lifetime. This was not caught when Fix L was
+        # made (that fix's own comment only noted the backstop "scales
+        # automatically," without checking whether regime-blindness made
+        # that scaling wrong for the other regime). FIXED by looking up
+        # each trade's own frozen regime (the same state dict custom_exit
+        # itself reads) and picking the matching timebomb constant as the
+        # backstop's basis, falling back to the old TRENDING-based limit
+        # only if a trade's regime cannot be determined (e.g. state
+        # missing/not yet restored after a restart) — never worse than the
+        # pre-fix behavior, just no longer wrong for ranging trades in the
+        # common case.
         try:
             open_trades = Trade.get_trades_proxy(is_open=True)
         except Exception:
@@ -3964,19 +4229,52 @@ class v12_Strategy(IStrategy):
             opened_at = trade.open_date_utc
             if opened_at is None:
                 continue
+
+            trade_state = self._active_sl_state.get(trade.id)
+            # AUDIT FIX Q (2026-09-08): use .get("regime"), not
+            # trade_state["regime"]. _active_sl_state entries created by
+            # custom_stoploss's first-call branch and entries restored by
+            # _restore_active_sl_state both always include "regime" today
+            # (the latter enforces this via its own required_keys check),
+            # so a KeyError here would not be expected in normal operation
+            # — but this method is a WATCHDOG, whose entire purpose is to
+            # keep running and recover stuck trades even when something
+            # else has gone wrong. An unguarded trade_state["regime"] would
+            # let a single malformed/partial state dict for ONE trade raise
+            # an uncaught KeyError that aborts this whole loop iteration —
+            # silently skipping the stuck-trade check for EVERY open trade,
+            # not just the one with bad state, which is exactly the
+            # failure mode this watchdog exists to prevent elsewhere (see
+            # the try/except around Trade.get_trades_proxy above, and
+            # around execute_trade_exit below). Using .get(...) with a
+            # None default routes any such case into the same "unknown
+            # regime, fall back to the old TRENDING-based limit" branch
+            # already in place below, instead of crashing.
+            trade_regime = trade_state.get("regime") if trade_state else None
+            if trade_regime == "ranging":
+                base_timebomb_seconds = self.RANGING_TIMEBOMB_SECONDS
+                basis_label = "RANGING_TIMEBOMB_SECONDS"
+            else:
+                # Also covers trade_regime is None (unknown/not yet
+                # restored) and "trending" — the old, safe default.
+                base_timebomb_seconds = self.TRENDING_TIMEBOMB_SECONDS
+                basis_label = "TRENDING_TIMEBOMB_SECONDS"
+            watchdog_limit_seconds = 2 * base_timebomb_seconds
+
             age_seconds = (current_time - opened_at).total_seconds()
             if age_seconds <= watchdog_limit_seconds:
                 continue
 
             logger.warning(
                 "[Watchdog] Trade#%s (%s) open for %.0fs, exceeding "
-                "%.0fs (2x TRENDING_TIMEBOMB_SECONDS=%ds) watchdog limit. "
+                "%.0fs (2x %s=%ds, regime=%s) watchdog limit. "
                 "This trade's normal exit path likely stalled (stale "
                 "candles / exchange issue). Force-closing now so a single "
                 "stuck trade cannot freeze the whole bot under "
                 "max_open_trades=1.",
                 trade.id, trade.pair, age_seconds,
-                watchdog_limit_seconds, self.TRENDING_TIMEBOMB_SECONDS,
+                watchdog_limit_seconds, basis_label, base_timebomb_seconds,
+                trade_regime if trade_regime is not None else "unknown",
             )
             try:
                 self.execute_trade_exit(
