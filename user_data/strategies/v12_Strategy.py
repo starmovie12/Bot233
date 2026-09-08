@@ -3138,6 +3138,152 @@ class v12_Strategy(IStrategy):
                     pair, trade.id, regime,
                 )
 
+            # ---------------------------------------------------------------
+            # SOLUTIONS-DOC FIX (Problem 1/4, 2026-09-08) — AUDIT FIX P's
+            # flagged-but-unfixed gap: RANGING_TIMEBOMB_SECONDS (30-120s,
+            # after the entry_volatility_ratio scaling above) vs. the
+            # 20-minute (1200s) rolling_high_20/rolling_low_20 window the
+            # ranging entry trigger itself reads (populate_entry_trend) —
+            # the identical mismatch AUDIT FIX L already fixed on the
+            # trending side, never addressed here (see custom_exit's own
+            # AUDIT FIX P comment block for the full "why this wasn't just
+            # copied from L" reasoning this deliberately still respects).
+            #
+            # NOT a copy of trending's fixed 1200s — a ranging bounce is a
+            # mean-reversion setup, not a breakout-continuation, so it does
+            # not automatically deserve the same fixed ceiling. Instead:
+            # measure how fast price is ACTUALLY closing the distance to
+            # this trade's own target level (rolling_low_20 for a long
+            # bounce, rolling_high_20 for a short bounce — the same
+            # unshifted level already captured just above as
+            # entry_structure_level for ranging), and derive a per-trade
+            # time budget from that.
+            #
+            # DELIBERATELY NOT ATR-BASED: ATR (Average True Range) measures
+            # a candle's total high-low range — volatility — not direction
+            # or net progress toward a target. A choppy pair that whips up
+            # and down without ever closing in on the target has a high ATR
+            # too, and a naive distance/ATR-implied-speed formula would
+            # wrongly estimate that as "will arrive soon," giving the
+            # trades most likely to be losing (stalled, range-bound) the
+            # LEAST time — backwards. Measured instead as NET DIRECTIONAL
+            # VELOCITY: how much closer to the target price has actually
+            # moved, net, over a short recent lookback — not how much the
+            # candles moved in either direction.
+            #
+            # Computed ONCE here (first call only) and frozen into state,
+            # matching this method's existing atr_scale/entry_structure_
+            # level pattern — not recomputed on every later call.
+            #
+            # `dataframe` here is the SAME already-fetched variable from
+            # this method's very first line (self.dp.get_analyzed_dataframe
+            # call at entry to custom_stoploss) — not a second, separate
+            # fetch. Reusing it avoids both the extra data-provider call
+            # and any theoretical index-mismatch if two separate fetches
+            # ever returned slightly different dataframe snapshots.
+            # ---------------------------------------------------------------
+            dynamic_ranging_timebomb_seconds = None
+            if regime == "ranging":
+                try:
+                    target_level = (
+                        dataframe["rolling_high_20"].iloc[-1] if is_long
+                        else dataframe["rolling_low_20"].iloc[-1]
+                    )
+                    distance_to_target_now = abs(target_level - current_rate)
+
+                    # NET DIRECTIONAL VELOCITY lookback. PRE-TRADE DATA LEAK
+                    # GUARD: this whole computation runs inside
+                    # custom_stoploss's first-call branch, so at this exact
+                    # instant the trade has only existed for a few seconds —
+                    # but the lookback below reads dataframe's LATEST N
+                    # candles, which has no inherent relationship to
+                    # trade.open_date_utc. Clamp the lookback to the number
+                    # of 1-minute candles that have actually elapsed since
+                    # THIS trade opened, so it can never include market
+                    # movement from before the trade existed.
+                    VELOCITY_LOOKBACK_CANDLES = 5  # 5-minute lookback on 1m timeframe
+                    candles_since_open = int(
+                        (current_time - trade.open_date_utc).total_seconds() // 60
+                    )
+                    effective_lookback = max(
+                        1, min(VELOCITY_LOOKBACK_CANDLES, candles_since_open)
+                    )
+
+                    if len(dataframe) > effective_lookback and candles_since_open >= 1:
+                        price_then = dataframe["close"].iloc[-1 - effective_lookback]
+                        distance_to_target_then = abs(target_level - price_then)
+                        net_progress = distance_to_target_then - distance_to_target_now
+                        directional_velocity_per_minute = net_progress / effective_lookback
+                    else:
+                        # Trade is <1 minute old — no lookback candle can be
+                        # guaranteed pre-trade-free yet. Treat as flat/
+                        # unknown; the "== 0" branch below handles it with a
+                        # generous neutral default rather than guessing.
+                        directional_velocity_per_minute = 0.0
+
+                    if directional_velocity_per_minute > 0:
+                        # Genuinely closing in on the target — estimate
+                        # arrival time from this trade's own observed pace.
+                        estimated_minutes = (
+                            distance_to_target_now / directional_velocity_per_minute
+                        )
+                    elif directional_velocity_per_minute == 0:
+                        # Flat, or too new to measure yet — no directional
+                        # signal either way; a generous neutral default.
+                        estimated_minutes = 15.0
+                    else:
+                        # Moving AWAY from target. Magnitude-aware, not a
+                        # flat fixed penalty: a slightly-negative velocity
+                        # (normal ranging noise/bounce-back) still gets
+                        # close to the generous 15-minute default, while a
+                        # sharply-negative velocity (genuinely reversing
+                        # away) gets cut down toward the 1-minute floor —
+                        # so a mild pullback and a real breakdown are not
+                        # treated identically.
+                        #
+                        # directional_velocity_per_minute is a raw price-
+                        # units/minute figure, not a unitless "1.0" — this
+                        # is a multi-pair strategy (the same reason
+                        # atr_scale/CROSS-PAIR SCALE FIX exists everywhere
+                        # else in this method), so it must be normalized by
+                        # this trade's own atr_scale before being used in a
+                        # magnitude-based formula, exactly like every other
+                        # *_pts distance in this method.
+                        if atr_scale > 0:
+                            velocity_in_atr_units = (
+                                abs(directional_velocity_per_minute) / atr_scale
+                            )
+                        else:
+                            velocity_in_atr_units = 0.0
+                        estimated_minutes = float(
+                            np.clip(15.0 / (1.0 + velocity_in_atr_units), 1.0, 15.0)
+                        )
+
+                    # Safety floor/ceiling: never as short as the old 60s-ish
+                    # bug, never long enough to let a stalled trade sit open
+                    # indefinitely on this alone (Part 9.2's structure-
+                    # invalidation check above remains the faster safety-net
+                    # regardless of this timer's value).
+                    dynamic_ranging_timebomb_seconds = float(
+                        np.clip(estimated_minutes * 60.0, 45.0, 600.0)
+                    )
+                except Exception:
+                    # Same "never let an optional capture abort/crash a
+                    # trade" standard as entry_structure_level just above —
+                    # leaves dynamic_ranging_timebomb_seconds as None, which
+                    # custom_exit's fallback (state.get with the existing
+                    # ranging_timebomb_seconds.value * vol_ratio default)
+                    # already handles cleanly.
+                    logger.exception(
+                        "[Phase3-TimeBomb-Dynamic] %s trade#%s: failed to "
+                        "compute dynamic_ranging_timebomb_seconds; falling "
+                        "back to the fixed ranging_timebomb_seconds x "
+                        "vol_ratio behavior for this trade (unchanged from "
+                        "before this fix).",
+                        pair, trade.id,
+                    )
+                    dynamic_ranging_timebomb_seconds = None
+
             state = {
                 "regime": regime,
                 "entry_adaptive_sl_pts": entry_adaptive_sl_pts,
@@ -3183,6 +3329,29 @@ class v12_Strategy(IStrategy):
                 # check, exactly as the report's backward-compatibility
                 # requirement specifies.
                 "entry_structure_level": entry_structure_level,
+                # SOLUTIONS-DOC FIX (Problem 1/4): per-trade dynamic ranging
+                # timebomb budget computed just above (net-directional-
+                # velocity based). None when regime != "ranging" (trending
+                # keeps its own already-fixed AUDIT FIX L timer, unrelated
+                # to this field) or if the computation above hit an
+                # exception — custom_exit's reader falls back to the
+                # existing fixed-timer behavior in either case, so this
+                # is additive/optional exactly like entry_structure_level
+                # above it, NOT added to _restore_active_sl_state's
+                # required_keys for the same backward-compatibility reason.
+                "dynamic_ranging_timebomb_seconds": dynamic_ranging_timebomb_seconds,
+                # SOLUTIONS-DOC FIX (Problem 2/5): sticky timebomb-exemption
+                # latch. Starts False for every trade; custom_exit sets this
+                # True (permanently, once) the first time this trade's true
+                # (current_profit-based) profit reaches
+                # timebomb_profit_exempt_pts, so a later pullback below that
+                # threshold can never force-close a trade that was already
+                # exempted — fixes the flapping/re-check bug where the old
+                # non-sticky check re-ran fresh on every call. Also NOT
+                # added to required_keys, same reasoning as the two fields
+                # above: a restored trade missing this key simply defaults
+                # to False via .get() and re-earns the latch normally.
+                "timebomb_exempted": False,
             }
             self._active_sl_state[trade.id] = state
             logger.info(
@@ -3543,11 +3712,17 @@ class v12_Strategy(IStrategy):
             else self.trending_breakeven_trigger_pts.value
         ) * state["entry_volatility_ratio"] * state["atr_scale"]  # frozen entry multiplier, per blueprint
 
-        profit_pts = (
-            (current_rate - trade.open_rate)
-            if is_long
-            else (trade.open_rate - current_rate)
-        )
+        # SOLUTIONS-DOC FIX (Problem 3/6): fee-aware true profit, via the
+        # shared _net_profit_pts helper (same one custom_exit's timebomb-
+        # exemption latch now uses), replacing the old raw
+        # (current_rate - trade.open_rate) price-diff that had no fee
+        # awareness. This matters here specifically because
+        # breakeven_trigger_pts/trailing_distance_pts are meant to
+        # represent real, bankable profit thresholds — arming either one
+        # off a raw price move that round-trip fees would fully consume
+        # defeats their purpose the same way the old fixed
+        # trade.open_rate breakeven floor (see below) did.
+        profit_pts = self._net_profit_pts(current_profit, trade, state["atr_scale"])
 
         if not state["breakeven_armed"] and profit_pts >= breakeven_trigger_pts:
             state["breakeven_armed"] = True
@@ -3909,53 +4084,95 @@ class v12_Strategy(IStrategy):
         # picked by analogy to the trending fix.
         if regime == "ranging":
             vol_ratio = state.get("entry_volatility_ratio", 1.0)
-            timebomb_seconds = self.ranging_timebomb_seconds.value * vol_ratio
+            # SOLUTIONS-DOC FIX (Problem 1/4): prefer this trade's own
+            # per-trade dynamic timer (net-directional-velocity based,
+            # computed once at entry in custom_stoploss — see that
+            # method's "SOLUTIONS-DOC FIX (Problem 1/4)" block). Falls
+            # back to the original fixed-timer x vol_ratio behavior,
+            # UNCHANGED, whenever the dynamic value isn't available (older
+            # restored trade predating this field, or the computation
+            # hit an exception at entry) — same additive/backward-
+            # compatible pattern as entry_structure_level above.
+            timebomb_seconds = state.get(
+                "dynamic_ranging_timebomb_seconds",
+                self.ranging_timebomb_seconds.value * vol_ratio,
+            )
+            if timebomb_seconds is None:  # explicit None also falls back
+                timebomb_seconds = self.ranging_timebomb_seconds.value * vol_ratio
         else:
             timebomb_seconds = self.trending_timebomb_seconds.value  # NOT adaptive, per blueprint
 
         if seconds_open >= timebomb_seconds:
-            # AUDIT FIX J: compute profit in atr_scale-adjusted points, the
-            # same unit custom_stoploss's breakeven/trailing math already
-            # uses, so this is comparable across pairs of very different
-            # price levels (see the "CROSS-PAIR SCALE FIX" comments on
-            # breakout_magnitude_*/custom_stoploss above for the same
-            # convention applied elsewhere in this file).
-            atr_scale = state.get("atr_scale", 1.0)
-            # is_long already resolved above (PART 9.2 block) — not
-            # re-derived here to avoid a pointless duplicate assignment.
-            if atr_scale and atr_scale > 0:
-                profit_pts = (
-                    (current_rate - trade.open_rate)
-                    if is_long
-                    else (trade.open_rate - current_rate)
-                ) / atr_scale
-            else:
-                # Defensive fallback if atr_scale was never populated for
-                # this trade (should not happen post-entry, but this method
-                # must never raise on a malformed/missing state dict — see
-                # this file's existing "fail loud, never silently swallow"
-                # standard elsewhere, applied here as "never let a missing
-                # optimization exempt a trade AND never crash the bot" by
-                # falling back to the pre-fix, always-fire behavior).
-                profit_pts = 0.0
+            # SOLUTIONS-DOC FIX (Problem 2/5) — STICKY LATCH, checked
+            # first. The old check re-ran fresh on every call with no
+            # persisted "already exempted" flag: a trade reaching +2.1pt
+            # would skip the forced exit on that one call, then a normal
+            # pullback to +1.7pt on the very next call would force-close
+            # it anyway (time never runs backward, so seconds_open >=
+            # timebomb_seconds stays true) — making AUDIT FIX J's
+            # exemption effectively only protect trades that happened to
+            # stay above the threshold on EVERY single call, rare in a
+            # noisy/ranging market. Once latched True here, this trade is
+            # permanently exempt from the timebomb for the rest of its
+            # life — Phase 4's trailing-stop (independent of this check)
+            # remains in control of it from here on.
+            if state.get("timebomb_exempted", False):
+                return None
 
-            if profit_pts >= self.timebomb_profit_exempt_pts.value:
+            # SOLUTIONS-DOC FIX (Problem 3/6): profit measured via the
+            # shared _net_profit_pts helper, which is based on Freqtrade's
+            # own fee-inclusive current_profit (already accounts for
+            # fee + slippage + funding-rate + tier-discount) rather than
+            # the old raw (current_rate - trade.open_rate) price-diff,
+            # which had zero fee awareness at all — see that helper's own
+            # docstring for the full reasoning, and custom_stoploss's
+            # breakeven-floor block for the same helper applied there.
+            atr_scale = state.get("atr_scale", 1.0)
+            net_profit_pts = self._net_profit_pts(current_profit, trade, atr_scale)
+
+            if net_profit_pts >= self.timebomb_profit_exempt_pts.value:
+                state["timebomb_exempted"] = True  # <-- LATCH: never re-checked again
+
+                # SOLUTIONS-DOC FIX (Problem 2/5) — REVERSAL PROTECTION.
+                # Latching the exemption alone stops the timebomb but does
+                # nothing to protect the profit that just earned it: if a
+                # sharp reversal hits in the moment right after exemption,
+                # this trade would otherwise ride custom_stoploss's normal
+                # (wider) Active-SL all the way down with no immediate
+                # floor. Force-arming breakeven here — the same
+                # `breakeven_armed` flag custom_stoploss's own trigger
+                # would eventually set organically — makes
+                # `candidate_price = max(candidate_price, trade.open_rate)`
+                # (long) / `min(..., trade.open_rate)` (short) active from
+                # this exact moment on, so the trade can no longer fall all
+                # the way back to a full stop-loss loss immediately after
+                # being marked "safely exempted."
+                if not state.get("breakeven_armed", False):
+                    state["breakeven_armed"] = True
+                    logger.info(
+                        "[Phase3-TimeBomb] %s trade#%s: exempt hote hi "
+                        "breakeven bhi force-armed kiya gaya (reversal "
+                        "protection).",
+                        pair, trade.id,
+                    )
+
+                self._persist_active_sl_state(trade, state)  # restart-safe too
                 logger.info(
-                    "[Phase3-TimeBomb] %s trade#%s: time-bomb threshold "
-                    "reached at %.1fs but trade is +%.2fpt (>= exempt "
+                    "[Phase3-TimeBomb] %s trade#%s: PERMANENTLY exempted "
+                    "at net_profit=%.2fpt (current_profit=%.4f, >= exempt "
                     "threshold %.2fpt) — skipping forced exit, leaving "
                     "Phase 4 trailing-stop in control.",
-                    pair, trade.id, seconds_open, profit_pts,
+                    pair, trade.id, net_profit_pts, current_profit,
                     self.timebomb_profit_exempt_pts.value,
                 )
                 return None
 
             logger.info(
                 "[Phase3-TimeBomb] %s trade#%s: time-bomb exit at %.1fs "
-                "(threshold=%.1fs, regime=%s, profit=%.2fpt, below exempt "
-                "threshold %.2fpt).",
+                "(threshold=%.1fs, regime=%s, net_profit=%.2fpt, below "
+                "exempt threshold %.2fpt).",
                 pair, trade.id, seconds_open, timebomb_seconds, regime,
-                profit_pts, self.timebomb_profit_exempt_pts.value,
+                net_profit_pts, self.timebomb_profit_exempt_pts.value,
             )
             return "phase3_timebomb_exit"
 
@@ -4604,6 +4821,41 @@ class v12_Strategy(IStrategy):
             )
 
     _ACTIVE_SL_CUSTOM_DATA_KEY = "v12_active_sl_state"
+
+    def _net_profit_pts(self, current_profit: float, trade: Trade, atr_scale: float) -> float:
+        """
+        SOLUTIONS-DOC FIX (Problem 3/6, 2026-09-08 — fee-aware true P&L).
+
+        ONE true-profit function, meant to be the single place every
+        profit-based decision in this file (breakeven arm, timebomb-
+        exemption, and any future profit-threshold logic) reads from,
+        instead of each spot separately recomputing a raw
+        `current_rate - trade.open_rate` price-diff with no fee awareness.
+
+        WHY current_profit AND NOT A MANUAL FEE SUBTRACTION: Freqtrade
+        already passes `current_profit` into both custom_stoploss and
+        custom_exit as a fee-inclusive ratio — it already nets out
+        open/close fees, slippage, and (for this Bybit perpetual-futures
+        strategy) funding-rate, using the exchange's own tier-based
+        fee-discount schedule. A hand-rolled `_round_trip_fee_pts` style
+        helper would only ever approximate open+close fee and miss
+        slippage/funding entirely, would never exactly match Freqtrade's
+        own number, and — worse, in live trading where execution price
+        already reflects real slippage — subtracting fees AGAIN on top of
+        a raw price-diff double-counts that cost once via the bad fill
+        price and a second time via the manual subtraction. Converting the
+        already-correct `current_profit` into this file's own point-scale
+        has neither problem: it is a pure UNIT CONVERSION (ratio -> ATR-
+        scaled points), not a second, competing profit calculation.
+
+        `current_profit` must be passed in as the method-parameter
+        Freqtrade itself supplies to custom_stoploss/custom_exit — this
+        helper never recomputes it from `trade` on its own.
+        """
+        if atr_scale is None or atr_scale <= 0:
+            return 0.0
+        profit_price_distance = trade.open_rate * current_profit
+        return profit_price_distance / atr_scale
 
     def _persist_active_sl_state(self, trade: Trade, state: dict) -> None:
         """
